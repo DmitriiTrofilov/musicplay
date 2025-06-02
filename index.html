@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>YouTube Music Stream</title>
+</head>
+<body>
+  <h1>YouTube Music Streamer</h1>
+  <label for="mode">Select Mode:</label>
+  <select id="mode">
+    <option value="song">Song</option>
+    <option value="genre">Genre</option>
+    <option value="playlist">Playlist</option>
+  </select>
+
+  <br><br>
+  <input type="text" id="query" placeholder="Enter song name, genre, or playlist URL" size="80" />
+  <button onclick="fetchAndPlay()">Play</button>
+
+  <br><br>
+  <audio id="audio" controls autoplay></audio>
+
+  <script>
+    let queue = [];
+    let currentTrack = 0;
+
+    async function fetchAndPlay() {
+      const mode = document.getElementById('mode').value;
+      const query = document.getElementById('query').value.trim();
+      const res = await fetch(`https://YOUR_BACKEND_URL/stream?mode=${mode}&query=${encodeURIComponent(query)}`);
+      const data = await res.json();
+
+      if (data.error) {
+        alert("Error: " + data.error);
+        return;
+      }
+
+      queue = data.tracks || [];
+      currentTrack = 0;
+      playCurrentTrack();
+    }
+
+    function playCurrentTrack() {
+      const audio = document.getElementById('audio');
+      if (queue[currentTrack]) {
+        audio.src = queue[currentTrack].url;
+        audio.play();
+      }
+    }
+
+    document.getElementById('audio').addEventListener('ended', () => {
+      currentTrack++;
+      if (currentTrack < queue.length) {
+        playCurrentTrack();
+      }
+    });
+  </script>
+</body>
+</html>
