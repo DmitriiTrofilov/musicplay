@@ -1,5 +1,5 @@
-fastapi
-uvicorn[standard]
+Flask
+Flask-CORS
+ytmusicapi
 yt-dlp
-httpx
-requests
+gunicorn
