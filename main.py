@@ -1,12 +1,12 @@
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-import subprocess
 import asyncio
+import subprocess
 
 app = FastAPI()
 
-# Allow all origins for testing (adjust for production)
+# Allow all CORS for testing
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -17,7 +17,7 @@ app.add_middleware(
 async def iter_process_stdout(process):
     loop = asyncio.get_event_loop()
     while True:
-        chunk = await loop.run_in_executor(None, process.stdout.read, 1024*8)
+        chunk = await loop.run_in_executor(None, process.stdout.read, 8192)
         if not chunk:
             break
         yield chunk
@@ -27,28 +27,36 @@ async def stream(mode: str = Query("search"), query: str = Query(...)):
     if not query:
         raise HTTPException(status_code=400, detail="Query parameter required")
 
-    # Construct yt-dlp URL
+    # Build URL for yt-dlp input
     if mode == "search":
         url = f"ytsearch:{query}"
     elif mode == "playlist":
         url = query
     else:
-        # fallback to direct URL or search
         url = query
 
-    cmd = [
+    yt_dlp_cmd = [
         "yt-dlp",
-        "--cookies",
-        "cookies.txt",
-        "-f",
-        "bestaudio",
-        "-o",
-        "-",
+        "--cookies", "cookies.txt",
+        "-f", "bestaudio",
+        "-o", "-",
         "--quiet",
         "--no-warnings",
         url,
     ]
 
-    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    ffmpeg_cmd = [
+        "ffmpeg",
+        "-i", "pipe:0",
+        "-f", "mp3",
+        "-codec:a", "libmp3lame",
+        "-b:a", "192k",
+        "-vn",
+        "pipe:1",
+    ]
 
-    return StreamingResponse(iter_process_stdout(process), media_type="audio/mpeg")
+    yt_process = subprocess.Popen(yt_dlp_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    ffmpeg_process = subprocess.Popen(ffmpeg_cmd, stdin=yt_process.stdout, stdout=subprocess.PIPE)
+    yt_process.stdout.close()
+
+    return StreamingResponse(iter_process_stdout(ffmpeg_process), media_type="audio/mpeg")
