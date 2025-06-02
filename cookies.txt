@@ -2,8 +2,11 @@
 # http://curl.haxx.se/rfc/cookie_spec.html
 # This is a generated file!  Do not edit.
 
-.youtube.com	TRUE	/	TRUE	0	YSC	tRnCUurf__E
-.youtube.com	TRUE	/	TRUE	1764399654	VISITOR_INFO1_LIVE	ed5u4xiZXng
-.youtube.com	TRUE	/	TRUE	1764399654	VISITOR_PRIVACY_METADATA	CgJBRRIEGgAgZw%3D%3D
+
+.youtube.com	TRUE	/	TRUE	1764404482	VISITOR_INFO1_LIVE	ed5u4xiZXng
+.youtube.com	TRUE	/	TRUE	1764404482	VISITOR_PRIVACY_METADATA	CgJBRRIEGgAgZw%3D%3D
 .youtube.com	TRUE	/	FALSE	1756623557	_gcl_au	1.1.1550123487.1748847557
 .youtube.com	TRUE	/	TRUE	1764399558	__Secure-ROLLOUT_TOKEN	CIGlncmdz-bCtgEQgKrZ6ZTSjQMY3uPE65TSjQM%3D
+.youtube.com	TRUE	/	TRUE	1748854276	GPS	1
+.youtube.com	TRUE	/	TRUE	0	YSC	KzLYttGh6P8
+.youtube.com	TRUE	/	TRUE	1783412485	PREF	f4=4000000&f6=40000000&tz=Asia.Dubai
