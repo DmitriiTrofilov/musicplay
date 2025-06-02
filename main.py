@@ -14,10 +14,11 @@ def stream_audio(query: str = Query(..., min_length=1)):
 
     # yt-dlp command with cookies.txt usage
     command = (
-        f"yt-dlp --cookies cookies.txt -o - --quiet --no-warnings "
-        f"-f bestaudio[ext=m4a]/bestaudio "
-        f"ytsearch1:{shlex.quote(query)}"
-    )
+    f"yt-dlp --cookies cookies.txt -o - --quiet --no-warnings "
+    f"-f bestaudio[ext=m4a]/bestaudio "
+    f"ytsearch1:{shlex.quote(query)}"
+)
+
     logging.info(f"Running command: {command}")
 
     try:
