@@ -1,62 +1,82 @@
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query, HTTPException, Response
 from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+import yt_dlp
 import subprocess
 import asyncio
-import os
 
 app = FastAPI()
 
-COOKIE_FILE = "cookies.txt"  # Make sure this file is uploaded with backend
+# Allow all origins (adjust for production)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
+
+COOKIES_PATH = "cookies.txt"  # your cookies file path for yt-dlp auth
+
+def get_audio_url(ytdlp_url: str) -> str:
+    """Use yt-dlp to get direct audio stream URL."""
+    ytdlp_opts = {
+        "format": "bestaudio/best",
+        "quiet": True,
+        "nocheckcertificate": True,
+        "skip_download": True,
+        "cookiefile": COOKIES_PATH,
+        "extract_flat": False,
+    }
+    with yt_dlp.YoutubeDL(ytdlp_opts) as ydl:
+        info = ydl.extract_info(ytdlp_url, download=False)
+        # If this is a playlist, pick first entry
+        if "entries" in info:
+            info = info["entries"][0]
+        audio_url = info.get("url")
+        if not audio_url:
+            # fallback to formats
+            formats = info.get("formats", [])
+            for f in formats:
+                if f.get("acodec") != "none":
+                    audio_url = f.get("url")
+                    break
+        if not audio_url:
+            raise ValueError("No audio URL found")
+        return audio_url
 
 @app.get("/stream")
-async def stream(mode: str = Query(...), query: str = Query(...)):
-    print(f"[INFO] Received request: mode={mode}, query={query}")
-
-    if not os.path.exists(COOKIE_FILE):
-        raise HTTPException(status_code=500, detail="cookies.txt not found on server")
-
+async def stream_audio(mode: str = Query(...), query: str = Query(...)):
+    """
+    Modes:
+    - playlist: query = playlist URL
+    - song: query = song URL
+    - genre: query = genre or search term
+    """
+    # Determine the yt-dlp search URL
     if mode == "playlist":
-        yt_url = query
+        url = query
     elif mode == "song":
-        yt_url = query
+        url = query
     elif mode == "genre":
-        # Simple ytsearch for genre term
-        yt_url = f"ytsearch:{query}"
+        # yt-dlp YouTube search URL for genre term, pick first video
+        url = f"ytsearch1:{query} audio"
     else:
         raise HTTPException(status_code=400, detail="Invalid mode")
 
-    cmd = [
-        "yt-dlp",
-        "--cookies", COOKIE_FILE,
-        "-f", "bestaudio",
-        "-g",  # Get direct media URL
-        yt_url
-    ]
+    try:
+        audio_url = get_audio_url(url)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"yt-dlp error: {e}")
 
-    print(f"[INFO] Running command: {' '.join(cmd)}")
+    # Stream audio to client via proxying with requests
+    import httpx
 
-    # Run command async, get media URL
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
-
-    stdout, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        error_message = stderr.decode()
-        print(f"[ERROR] yt-dlp error: {error_message}")
-        raise HTTPException(status_code=500, detail="Failed to extract media URL")
-
-    media_url = stdout.decode().strip().split("\n")[0]  # Use first URL
-    print(f"[INFO] Media URL: {media_url}")
-
-    # Stream audio from direct URL (pass through)
-    def iterfile():
-        import requests
-        with requests.get(media_url, stream=True) as r:
-            for chunk in r.iter_content(chunk_size=8192):
-                if chunk:
+    async def audio_streamer():
+        async with httpx.AsyncClient(timeout=None) as client:
+            async with client.stream("GET", audio_url) as r:
+                if r.status_code != 200:
+                    raise HTTPException(status_code=500, detail="Failed to fetch audio stream")
+                async for chunk in r.aiter_bytes(chunk_size=1024*32):
                     yield chunk
 
-    return StreamingResponse(iterfile(), media_type="audio/mpeg")
+    return StreamingResponse(audio_streamer(), media_type="audio/mpeg")
