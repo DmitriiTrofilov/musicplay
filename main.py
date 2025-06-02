@@ -12,7 +12,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-CORS(app)
+# --- MODIFICATION START ---
+# Allow CORS from any origin for all routes
+CORS(app, resources={r"/*": {"origins": "*"}})
+# --- MODIFICATION END ---
 
 # --- YouTube Music API Setup ---
 try:
