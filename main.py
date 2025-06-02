@@ -22,7 +22,7 @@ except Exception as e:
     logger.error(f"Failed to initialize YTMusic: {e}")
     # Consider exiting or disabling functionality if YTMusic is critical
 
-# --- yt-dlp Configuration for MP3 download ---
+# --- yt-dlp Configuration for audio download ---
 
 # Define the name of the temporary directory
 TEMP_AUDIO_DIR_NAME = 'temp_audio'
@@ -39,27 +39,22 @@ if not os.path.exists(TEMP_AUDIO_DIR):
         logger.error(f"Error creating temporary audio directory {TEMP_AUDIO_DIR}: {e}")
         # This could be a critical error if the directory cannot be created.
 
-COOKIES_FILE_PATH = 'cookies.txt' # Assumes cookies.txt is in the root of your project
+COOKIES_FILE_PATH = 'cookies.txt'  # Assumes cookies.txt is in the root of your project
 absolute_cookies_path = os.path.abspath(COOKIES_FILE_PATH)
 
 YDL_OPTS_BASE = {
     'format': 'bestaudio/best',
-    'postprocessors': [{
-        'key': 'FFmpegExtractAudio',
-        'preferredcodec': 'mp3',
-        'preferredquality': '192',
-    }],
     'noplaylist': True,
     'quiet': False,
     'no_warnings': False,
     'paths': {'home': TEMP_AUDIO_DIR},  # All output files go into this directory
-    'outtmpl': '%(id)s.%(ext)s',        # Filename template *within* paths.home.
-                                        # yt-dlp will create e.g., TEMP_AUDIO_DIR/videoid.webm,
-                                        # and the postprocessor will create TEMP_AUDIO_DIR/videoid.mp3.
+    'outtmpl': '%(id)s.%(ext)s',  # Filename template *within* paths.home.
+    # yt-dlp will create e.g., TEMP_AUDIO_DIR/videoid.webm,
+    # and the postprocessor will create TEMP_AUDIO_DIR/videoid.mp3.
     # 'ffmpeg_location': '/usr/bin/ffmpeg', # COMMENTED OUT: Let yt-dlp find ffmpeg in PATH.
-                                            # This is usually more robust on Render/PaaS.
-                                            # If FFmpeg errors occur, ensure it's installed and in PATH.
-    'verbose': True, # Add verbose logging from yt-dlp for debugging
+    # This is usually more robust on Render/PaaS.
+    # If FFmpeg errors occur, ensure it's installed and in PATH.
+    'verbose': True,  # Add verbose logging from yt-dlp for debugging
 }
 
 if os.path.exists(absolute_cookies_path):
@@ -75,6 +70,7 @@ else:
 @app.route('/')
 def health_check():
     return jsonify({"status": "ok", "message": "Backend is running!"}), 200
+
 
 @app.route('/search_and_download', methods=['GET'])
 def search_and_download():
@@ -103,35 +99,21 @@ def search_and_download():
             logger.error("Could not get video ID for the song.")
             return jsonify({"error": "Could not get video ID for the song"}), 500
 
-        unique_mp3_filename = f"{str(uuid.uuid4())}.mp3"
-        final_mp3_path = os.path.join(TEMP_AUDIO_DIR, unique_mp3_filename)
+        unique_audio_filename = f"{str(uuid.uuid4())}"
+        final_audio_path = os.path.join(TEMP_AUDIO_DIR, unique_audio_filename)
 
-        # This is the path where yt-dlp (after post-processing) should place the MP3.
-        # It's based on video_id.mp3 inside TEMP_AUDIO_DIR.
-        expected_downloaded_mp3_path = os.path.join(TEMP_AUDIO_DIR, f"{video_id}.mp3")
-        logger.info(f"Expecting MP3 at: {expected_downloaded_mp3_path}")
-
+        # This is the path where yt-dlp will place the downloaded audio.
+        expected_downloaded_audio_path = os.path.join(TEMP_AUDIO_DIR, f"{video_id}")
+        logger.info(f"Expecting audio at: {expected_downloaded_audio_path}")
 
         # Clean up any pre-existing file with the same video_id or unique name from a failed previous run
-        for path_to_clean in [expected_downloaded_mp3_path, final_mp3_path]:
+        for path_to_clean in [expected_downloaded_audio_path, final_audio_path]:
             if os.path.exists(path_to_clean):
                 try:
                     os.remove(path_to_clean)
                     logger.info(f"Removed pre-existing file: {path_to_clean}")
                 except Exception as e:
                     logger.warning(f"Could not remove pre-existing file {path_to_clean}: {e}")
-        
-        # Also clean up potential original downloaded files (e.g. .webm, .m4a)
-        # based on video_id if they exist from a previous interrupted run.
-        for ext_to_clean in ['.webm', '.m4a', '.opus', '.ogg']:
-            potential_orig_file = os.path.join(TEMP_AUDIO_DIR, f"{video_id}{ext_to_clean}")
-            if os.path.exists(potential_orig_file):
-                try:
-                    os.remove(potential_orig_file)
-                    logger.info(f"Removed pre-existing original format file: {potential_orig_file}")
-                except Exception as e:
-                    logger.warning(f"Could not remove pre-existing original file {potential_orig_file}: {e}")
-
 
         # Use a fresh copy of YDL_OPTS_BASE for this download instance
         ydl_opts_specific = YDL_OPTS_BASE.copy()
@@ -140,50 +122,51 @@ def search_and_download():
             logger.info(f"Starting download for video ID: {video_id} with options: {ydl_opts_specific}")
             download_url = f'https://music.youtube.com/watch?v={video_id}'
             ydl.download([download_url])
-            # The log from yt-dlp itself (with verbose:True) should now show the correct destination path for FFmpeg.
-            logger.info(f"Download process (including post-processing) reported as complete for video ID: {video_id}.")
+            # The log from yt-dlp itself (with verbose:True) should now show the correct destination path.
+            logger.info(f"Download process reported as complete for video ID: {video_id}.")
 
+        # Determine the actual downloaded file extension
+        downloaded_file_ext = None
+        for filename in os.listdir(TEMP_AUDIO_DIR):
+            if filename.startswith(video_id):
+                downloaded_file_ext = filename[len(video_id) + 1:]  # +1 for the dot
+                break
 
-        if not os.path.exists(expected_downloaded_mp3_path):
-            logger.error(f"MP3 file NOT FOUND at expected path after download: {expected_downloaded_mp3_path}")
-            logger.info(f"Contents of {TEMP_AUDIO_DIR}: {os.listdir(TEMP_AUDIO_DIR)}") # List dir contents
-            # Check for original downloaded file if MP3 is missing, indicating FFmpeg issue
-            possible_original_extensions = ['.webm', '.m4a', '.opus', '.ogg']
-            found_original_file = None
-            for ext in possible_original_extensions:
-                original_file_path_check = os.path.join(TEMP_AUDIO_DIR, f"{video_id}{ext}")
-                if os.path.exists(original_file_path_check):
-                    found_original_file = original_file_path_check
-                    logger.warning(f"Found original downloaded file: {found_original_file}. FFmpeg conversion to MP3 might have failed or output to a different name.")
-                    break
-            if found_original_file:
-                 return jsonify({"error": f"Audio downloaded ({os.path.basename(found_original_file)}) but MP3 conversion failed or MP3 not found at expected location."}), 500
-            return jsonify({"error": "Critical error: MP3 file not found after download and FFmpeg processing. Check logs for FFmpeg errors."}), 500
+        if not downloaded_file_ext:
+            logger.error(f"Audio file NOT FOUND after download for video ID: {video_id}")
+            logger.info(f"Contents of {TEMP_AUDIO_DIR}: {os.listdir(TEMP_AUDIO_DIR)}")  # List dir contents
+            return jsonify({"error": "Critical error: Audio file not found after download. Check logs."}), 500
 
-        # Rename the video_id.mp3 to a unique name before sending
-        # This helps prevent conflicts if multiple requests for the same song occur nearly simultaneously,
-        # though cleanup should ideally handle this. It's more for robustness during the send_file operation.
-        os.rename(expected_downloaded_mp3_path, final_mp3_path)
-        logger.info(f"Renamed downloaded MP3 from {expected_downloaded_mp3_path} to {final_mp3_path}")
+        expected_downloaded_audio_path = f"{expected_downloaded_audio_path}.{downloaded_file_ext}"
+        final_audio_path = f"{final_audio_path}.{downloaded_file_ext}"
 
-        logger.info(f"Sending file: {final_mp3_path}")
+        if not os.path.exists(expected_downloaded_audio_path):
+            logger.error(f"Downloaded audio file NOT FOUND at expected path: {expected_downloaded_audio_path}")
+            logger.info(f"Contents of {TEMP_AUDIO_DIR}: {os.listdir(TEMP_AUDIO_DIR)}")  # List dir contents
+            return jsonify({"error": "Critical error: Downloaded audio file not found. Check logs."}), 500
+
+        # Rename the downloaded audio file to a unique name before sending
+        os.rename(expected_downloaded_audio_path, final_audio_path)
+        logger.info(f"Renamed downloaded audio from {expected_downloaded_audio_path} to {final_audio_path}")
+
+        logger.info(f"Sending file: {final_audio_path}")
         response = send_file(
-            final_mp3_path,
+            final_audio_path,
             as_attachment=True,
-            download_name=f"{song_artist} - {song_title}.mp3",
-            mimetype='audio/mpeg'
+            download_name=f"{song_artist} - {song_title}.{downloaded_file_ext}",
+            mimetype='audio/mpeg' if downloaded_file_ext == 'mp3' else 'audio/webm'  # Adjust mimetype as needed
         )
 
         @response.call_on_close
         def cleanup_file():
             try:
-                if os.path.exists(final_mp3_path):
-                    os.remove(final_mp3_path)
-                    logger.info(f"Cleaned up temporary file: {final_mp3_path}")
+                if os.path.exists(final_audio_path):
+                    os.remove(final_audio_path)
+                    logger.info(f"Cleaned up temporary file: {final_audio_path}")
                 else:
-                    logger.warning(f"Cleanup: File not found to delete: {final_mp3_path}")
+                    logger.warning(f"Cleanup: File not found to delete: {final_audio_path}")
             except Exception as e:
-                logger.error(f"Error cleaning up file {final_mp3_path}: {e}")
+                logger.error(f"Error cleaning up file {final_audio_path}: {e}")
 
         return response
 
@@ -193,14 +176,11 @@ def search_and_download():
         if "Sign in to confirm" in error_message:
             logger.error("Authentication error: Cookies might be invalid, expired, or not correctly applied.")
             return jsonify({"error": "Failed to download due to authentication issue. Cookies might be required or invalid."}), 500
-        # Check for common FFmpeg issues in the error message
-        if "ffmpeg" in error_message.lower() or "ffprobe" in error_message.lower():
-            logger.error("FFmpeg/FFprobe related error. Ensure FFmpeg is correctly installed and accessible in PATH on the server.")
-            return jsonify({"error": f"Audio processing error (FFmpeg): {error_message}"}), 500
         return jsonify({"error": f"Failed to download audio: {error_message}"}), 500
     except Exception as e:
         logger.error(f"An unexpected error occurred: {e}", exc_info=True)
         return jsonify({"error": f"An internal server error occurred: {str(e)}"}), 500
+
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5001))
