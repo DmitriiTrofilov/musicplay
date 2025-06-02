@@ -12,15 +12,15 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 def stream_audio(query: str = Query(..., min_length=1)):
     logging.info(f"Received stream request with query: '{query}'")
 
+    # yt-dlp command with cookies.txt usage
     command = (
-        f"yt-dlp -o - --quiet --no-warnings "
+        f"yt-dlp --cookies cookies.txt -o - --quiet --no-warnings "
         f"-f bestaudio[ext=m4a]/bestaudio "
         f"ytsearch1:{shlex.quote(query)}"
     )
     logging.info(f"Running command: {command}")
 
     try:
-        # Run yt-dlp and capture output fully
         completed_process = subprocess.run(
             command,
             shell=True,
