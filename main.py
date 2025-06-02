@@ -1,57 +1,62 @@
-from fastapi import FastAPI, Query
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, Query, HTTPException
+from fastapi.responses import StreamingResponse
 import subprocess
-import json
-import logging
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+import asyncio
+import os
 
 app = FastAPI()
 
-# Enable CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+COOKIE_FILE = "cookies.txt"  # Make sure this file is uploaded with backend
 
 @app.get("/stream")
-def stream(mode: str = Query(...), query: str = Query(...)):
-    logger.info(f"==> Received /stream request | mode: {mode} | query: {query}")
+async def stream(mode: str = Query(...), query: str = Query(...)):
+    print(f"[INFO] Received request: mode={mode}, query={query}")
 
-    try:
-        if mode == "playlist":
-            yt_query = query
-            cmd = ["yt-dlp", "-j", "-f", "bestaudio", yt_query]
-        else:
-            yt_query = f"ytsearch:{query}"
-            cmd = ["yt-dlp", "-j", "-f", "bestaudio", yt_query]
+    if not os.path.exists(COOKIE_FILE):
+        raise HTTPException(status_code=500, detail="cookies.txt not found on server")
 
-        logger.info(f"==> Running command: {' '.join(cmd)}")
+    if mode == "playlist":
+        yt_url = query
+    elif mode == "song":
+        yt_url = query
+    elif mode == "genre":
+        # Simple ytsearch for genre term
+        yt_url = f"ytsearch:{query}"
+    else:
+        raise HTTPException(status_code=400, detail="Invalid mode")
 
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+    cmd = [
+        "yt-dlp",
+        "--cookies", COOKIE_FILE,
+        "-f", "bestaudio",
+        "-g",  # Get direct media URL
+        yt_url
+    ]
 
-        videos = []
-        for line in result.stdout.decode().splitlines():
-            info = json.loads(line)
-            track_info = {
-                "title": info.get("title"),
-                "url": info.get("url")
-            }
-            logger.info(f"==> Fetched track: {track_info['title']}")
-            videos.append(track_info)
+    print(f"[INFO] Running command: {' '.join(cmd)}")
 
-        logger.info(f"==> Returning {len(videos)} track(s)")
-        return {"tracks": videos}
+    # Run command async, get media URL
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
 
-    except subprocess.CalledProcessError as e:
-        error_output = e.stderr.decode()
-        logger.error(f"==> yt-dlp error: {error_output}")
-        return {"error": "yt-dlp failed", "details": error_output}
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        error_message = stderr.decode()
+        print(f"[ERROR] yt-dlp error: {error_message}")
+        raise HTTPException(status_code=500, detail="Failed to extract media URL")
 
-    except Exception as e:
-        logger.exception("==> Unexpected error")
-        return {"error": "Unexpected error", "details": str(e)}
+    media_url = stdout.decode().strip().split("\n")[0]  # Use first URL
+    print(f"[INFO] Media URL: {media_url}")
+
+    # Stream audio from direct URL (pass through)
+    def iterfile():
+        import requests
+        with requests.get(media_url, stream=True) as r:
+            for chunk in r.iter_content(chunk_size=8192):
+                if chunk:
+                    yield chunk
+
+    return StreamingResponse(iterfile(), media_type="audio/mpeg")
