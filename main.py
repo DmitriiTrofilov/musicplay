@@ -1,12 +1,11 @@
 from fastapi import FastAPI, Query, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import RedirectResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-import asyncio
 import subprocess
+import requests
 
 app = FastAPI()
 
-# Allow all CORS for testing
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -14,49 +13,33 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-async def iter_process_stdout(process):
-    loop = asyncio.get_event_loop()
-    while True:
-        chunk = await loop.run_in_executor(None, process.stdout.read, 8192)
-        if not chunk:
-            break
-        yield chunk
-
-@app.get("/stream")
-async def stream(mode: str = Query("search"), query: str = Query(...)):
-    if not query:
-        raise HTTPException(status_code=400, detail="Query parameter required")
-
-    # Build URL for yt-dlp input
-    if mode == "search":
-        url = f"ytsearch:{query}"
-    elif mode == "playlist":
-        url = query
-    else:
-        url = query
-
-    yt_dlp_cmd = [
+def get_best_audio_url(query: str) -> str:
+    # Run yt-dlp to get best audio URL of the first search result
+    cmd = [
         "yt-dlp",
-        "--cookies", "cookies.txt",
-        "-f", "bestaudio",
-        "-o", "-",
         "--quiet",
         "--no-warnings",
-        url,
+        "--skip-download",
+        "--print", "url",
+        "-f", "bestaudio",
+        f"ytsearch1:{query}"
     ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0 or not result.stdout.strip():
+        raise Exception("yt-dlp failed or no URL found")
+    url = result.stdout.strip()
+    return url
 
-    ffmpeg_cmd = [
-        "ffmpeg",
-        "-i", "pipe:0",
-        "-f", "mp3",
-        "-codec:a", "libmp3lame",
-        "-b:a", "192k",
-        "-vn",
-        "pipe:1",
-    ]
+@app.get("/stream")
+async def stream(query: str = Query(...)):
+    try:
+        audio_url = get_best_audio_url(query)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-    yt_process = subprocess.Popen(yt_dlp_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    ffmpeg_process = subprocess.Popen(ffmpeg_cmd, stdin=yt_process.stdout, stdout=subprocess.PIPE)
-    yt_process.stdout.close()
+    # Option 1: Redirect client to audio URL (simpler, but client must support playing that URL)
+    return RedirectResponse(audio_url)
 
-    return StreamingResponse(iter_process_stdout(ffmpeg_process), media_type="audio/mpeg")
+    # Option 2: (alternative) Stream audio through backend (proxy)
+    # res = requests.get(audio_url, stream=True)
+    # return StreamingResponse(res.iter_content(chunk_size=8192), media_type="audio/mpeg")
