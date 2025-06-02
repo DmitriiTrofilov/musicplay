@@ -2,51 +2,47 @@ import logging
 import shlex
 import subprocess
 from fastapi import FastAPI, Query, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response
 
 app = FastAPI()
 
-# Configure logging to show INFO level messages and above
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
 @app.get("/stream")
 def stream_audio(query: str = Query(..., min_length=1)):
     logging.info(f"Received stream request with query: '{query}'")
 
-    # Prepare yt-dlp command
     command = (
         f"yt-dlp -o - --quiet --no-warnings "
         f"-f bestaudio[ext=m4a]/bestaudio "
-        f"--external-downloader ffmpeg "
-        f"--external-downloader-args '-vn -f mp3' "
         f"ytsearch1:{shlex.quote(query)}"
     )
     logging.info(f"Running command: {command}")
 
     try:
-        process = subprocess.Popen(
-            command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        # Run yt-dlp and capture output fully
+        completed_process = subprocess.run(
+            command,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
         )
-    except Exception as e:
-        logging.error(f"Failed to start yt-dlp process: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to start yt-dlp: {e}")
+    except subprocess.CalledProcessError as e:
+        logging.error(f"yt-dlp failed: {e.stderr.decode(errors='ignore')}")
+        raise HTTPException(status_code=500, detail="yt-dlp failed or no audio found")
 
-    if not process.stdout:
-        logging.error("No stdout pipe from yt-dlp process.")
-        raise HTTPException(status_code=500, detail="Failed to capture yt-dlp output")
+    audio_data = completed_process.stdout
+    data_len = len(audio_data)
 
-    logging.info("yt-dlp process started successfully, streaming audio now...")
+    logging.info(f"yt-dlp finished successfully, downloaded {data_len} bytes of audio")
 
     headers = {
         "Content-Type": "audio/mpeg",
+        "Content-Length": str(data_len),
         "Cache-Control": "no-cache",
         "Accept-Ranges": "bytes",
     }
 
-    # Return StreamingResponse to stream raw mp3 data
-    response = StreamingResponse(process.stdout, headers=headers)
-
-    # Log when the response is returned
-    logging.info("StreamingResponse prepared and returned to client.")
-
-    return response
+    logging.info("Sending full audio response to client")
+    return Response(content=audio_data, headers=headers, media_type="audio/mpeg")
