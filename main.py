@@ -83,8 +83,8 @@ def run_startup_diagnostics():
 
     # 2. Test basic info extraction for a known public video
     # Using yt-dlp's own test video ID 'BaW_jenozKc' (short, public, stable)
-    test_video_url = 'https://www.youtube.com/watch?v=BaW_jenozKc'
-    test_video_id = 'BaW_jenozKc'
+    test_video_url = 'https://www.youtube.com/watch?v=zGDzdps75ns'
+    test_video_id = 'zGDzdps75ns'
     logger.info(f"Attempting to extract info for test video: {test_video_url}")
     
     diag_ydl_opts = {
