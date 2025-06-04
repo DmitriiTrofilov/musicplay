@@ -2,11 +2,12 @@ import flask
 from flask import Flask, request, send_file, jsonify
 from flask_cors import CORS
 from ytmusicapi import YTMusic
-import yt_dlp
+import yt_dlp # Import at the top
 import os
 import uuid
 import logging
 import time
+import shutil # For shutil.which
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -16,12 +17,13 @@ app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 # --- YouTube Music API Setup ---
+# Consider using cookies with YTMusic if searches also become problematic:
+# YTMusic(absolute_cookies_path if os.path.exists(absolute_cookies_path) else None)
 try:
     ytmusic = YTMusic()
     logger.info("YTMusic initialized successfully.")
 except Exception as e:
     logger.error(f"Failed to initialize YTMusic: {e}", exc_info=True)
-    # Consider how to handle this - app might not be functional
 
 # --- yt-dlp Configuration ---
 TEMP_AUDIO_DIR_NAME = 'temp_audio'
@@ -40,20 +42,24 @@ absolute_cookies_path = os.path.abspath(COOKIES_FILE_PATH)
 YDL_OPTS_BASE = {
     'format': 'bestaudio/best',
     'noplaylist': True,
-    'quiet': False,        # Set to True for less console output from yt-dlp in production
-    'no_warnings': False,  # Set to True to suppress yt-dlp warnings
+    'quiet': False,
+    'no_warnings': False,
     'paths': {'home': TEMP_AUDIO_DIR},
-    # 'outtmpl' will be set per download to ensure unique naming based on video_id
-    'verbose': True,       # Good for debugging, can be set to False in production
-    'nocheckcertificate': True, # Can sometimes help with SSL issues on certain networks
-    # Consider adding a modern User-Agent if issues persist
-    # 'http_headers': {
-    #     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36',
-    # },
+    'verbose': True,
+    'nocheckcertificate': True,
+    'http_headers': {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0',
+        'Accept-Language': 'en-US,en;q=0.9',
+    },
+    'extractor_args': {
+        'youtube': {
+            'player_client': ['web', 'android', 'ios'],
+        }
+    },
 }
 
 if os.path.exists(absolute_cookies_path):
-    logger.info(f"Cookies file found at {absolute_cookies_path}. Adding to yt-dlp options.")
+    logger.info(f"Cookies file found at {absolute_cookies_path}. Adding to yt-dlp base options.")
     YDL_OPTS_BASE['cookiefile'] = absolute_cookies_path
 else:
     logger.warning(
@@ -61,11 +67,83 @@ else:
         f"yt-dlp will run without cookies. This may lead to 'Sign in to confirm' or availability errors."
     )
 
+# --- Startup Diagnostics ---
+def run_startup_diagnostics():
+    logger.info("--- Running yt-dlp Startup Diagnostics ---")
+    
+    # 1. Check yt-dlp version
+    try:
+        logger.info(f"Detected yt-dlp version: {yt_dlp.version.__version__}")
+        if "2025" in yt_dlp.version.__version__: # Check for the unusual version string
+            logger.warning(f"UNUSUAL yt-dlp version detected: {yt_dlp.version.__version__}. Please ensure this is intended and up-to-date from official sources.")
+    except Exception as e:
+        logger.error(f"DIAGNOSTIC FAILED: Could not get yt-dlp version: {e}", exc_info=True)
+        logger.info("--- yt-dlp Startup Diagnostics Complete (with errors) ---")
+        return
 
+    # 2. Test basic info extraction for a known public video
+    # Using yt-dlp's own test video ID 'BaW_jenozKc' (short, public, stable)
+    test_video_url = 'https://www.youtube.com/watch?v=BaW_jenozKc'
+    test_video_id = 'BaW_jenozKc'
+    logger.info(f"Attempting to extract info for test video: {test_video_url}")
+    
+    diag_ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'verbose': False, # Keep diagnostic logs tidy
+        'nocheckcertificate': YDL_OPTS_BASE.get('nocheckcertificate', True),
+        'http_headers': YDL_OPTS_BASE.get('http_headers', {}), # Use same headers as main app
+        'extractor_args': YDL_OPTS_BASE.get('extractor_args', {}), # Use same extractor args
+    }
+    # Include cookies in diagnostic test if they are configured and exist
+    if 'cookiefile' in YDL_OPTS_BASE and os.path.exists(YDL_OPTS_BASE['cookiefile']):
+        diag_ydl_opts['cookiefile'] = YDL_OPTS_BASE['cookiefile']
+        logger.info("Diagnostic info extraction will attempt to use cookies.")
+    else:
+        logger.info("Diagnostic info extraction will not use cookies.")
+
+    try:
+        with yt_dlp.YoutubeDL(diag_ydl_opts) as ydl:
+            logger.info(f"Diagnostic yt-dlp effective options: {ydl.params}")
+            info = ydl.extract_info(test_video_url, download=False)
+            if info and info.get('id') == test_video_id:
+                logger.info(f"DIAGNOSTIC PASSED: Successfully extracted info for '{info.get('title', 'N/A')}' (ID: {info.get('id')}).")
+            else:
+                logger.error(f"DIAGNOSTIC FAILED: Info extraction for test video {test_video_id} did not return expected data. Received info: {info}")
+    except yt_dlp.utils.DownloadError as de:
+        if "Video unavailable" in str(de):
+            logger.error(f"DIAGNOSTIC FAILED (CRITICAL): Test video {test_video_id} reported as UNAVAILABLE. This indicates a significant problem with YouTube access from this server/IP. Error: {de}", exc_info=True)
+        else:
+            logger.error(f"DIAGNOSTIC FAILED: yt-dlp DownloadError during info extraction for test video {test_video_id}: {de}", exc_info=True)
+    except Exception as e:
+        logger.error(f"DIAGNOSTIC FAILED: Unexpected error during info extraction for test video {test_video_id}: {e}", exc_info=True)
+
+    # 3. Check for ffmpeg and ffprobe
+    logger.info("Checking for ffmpeg and ffprobe in system PATH...")
+    ffmpeg_path = shutil.which("ffmpeg")
+    ffprobe_path = shutil.which("ffprobe")
+
+    if ffmpeg_path:
+        logger.info(f"DIAGNOSTIC INFO: ffmpeg found at: {ffmpeg_path}")
+    else:
+        logger.warning("DIAGNOSTIC WARNING: ffmpeg NOT found in system PATH. Audio conversion and some formats might not be available.")
+    
+    if ffprobe_path:
+        logger.info(f"DIAGNOSTIC INFO: ffprobe found at: {ffprobe_path}")
+    else:
+        logger.warning("DIAGNOSTIC WARNING: ffprobe NOT found in system PATH. Some functionalities might be limited.")
+
+    logger.info("--- yt-dlp Startup Diagnostics Complete ---")
+
+# Run diagnostics when the module is loaded by Python.
+# This happens for each Gunicorn worker and also when run directly via `python main.py`.
+run_startup_diagnostics()
+
+# --- Flask Routes ---
 @app.route('/')
 def health_check():
+    # You can also add a more detailed health check here, perhaps returning status of yt-dlp from diagnostics
     return jsonify({"status": "ok", "message": "Backend is running!"}), 200
-
 
 @app.route('/search_and_download', methods=['GET'])
 def search_and_download():
@@ -78,8 +156,7 @@ def search_and_download():
 
     try:
         logger.info(f"Searching for: '{search_query}' using YTMusic API")
-        # Fetch a few results to try if the first one fails
-        search_results = ytmusic.search(search_query, filter='songs', limit=3)
+        search_results = ytmusic.search(search_query, filter='songs', limit=5)
 
         if not search_results:
             logger.warning(f"No songs found for query: '{search_query}' via YTMusic API")
@@ -105,22 +182,17 @@ def search_and_download():
                 last_download_error_message = "A search result was missing a video ID."
                 continue
 
-            # Use a fresh copy of YDL_OPTS_BASE and set a specific output template for this attempt
             ydl_opts_specific = YDL_OPTS_BASE.copy()
-            # This ensures the downloaded file is named 'videoId.ext' in TEMP_AUDIO_DIR
-            ydl_opts_specific['outtmpl'] = {'default': f'{video_id}.%(ext)s'}
+            ydl_opts_specific['outtmpl'] = {
+                'default': f'{video_id}.%(ext)s',
+                'chapter': '%(title)s - %(section_number)03d %(section_title)s [%(id)s].%(ext)s'
+            }
+            if 'cookiefile' in ydl_opts_specific and not os.path.exists(ydl_opts_specific['cookiefile']):
+                 logger.warning(f"Cookie file {ydl_opts_specific['cookiefile']} not found for attempt {i+1}. Removing from options.")
+                 del ydl_opts_specific['cookiefile']
 
-
-            # Define paths for this attempt
-            # Base name for the uniquely named file we'll send to the user (extension added later)
-            unique_temp_filename_base = str(uuid.uuid4())
-            # Path where yt-dlp will download (e.g., /temp_audio/videoId.webm)
-            # Extension will be determined by yt-dlp
-            expected_download_path_pattern = os.path.join(TEMP_AUDIO_DIR, f"{video_id}.") # Note the dot
-
-            # Clean up any pre-existing files from previous (possibly failed) attempts for this video_id
             for f_cleanup in os.listdir(TEMP_AUDIO_DIR):
-                if f_cleanup.startswith(video_id + "."): # Matches videoId.ext
+                if f_cleanup.startswith(video_id + "."):
                     try:
                         os.remove(os.path.join(TEMP_AUDIO_DIR, f_cleanup))
                         logger.info(f"Removed pre-existing/partial file: {f_cleanup}")
@@ -129,14 +201,12 @@ def search_and_download():
             
             try:
                 with yt_dlp.YoutubeDL(ydl_opts_specific) as ydl:
-                    # Try standard YouTube URL, often more robust
                     download_url = f'https://www.youtube.com/watch?v={video_id}'
-                    logger.info(f"Starting download for video ID: {video_id} from {download_url} with options: {ydl_opts_specific}")
+                    logger.info(f"Starting download for video ID: {video_id} from {download_url} with effective options: {ydl.params}")
                     
                     ydl.download([download_url])
                     logger.info(f"Download process reported as complete for video ID: {video_id}.")
 
-                # Find the downloaded file and its extension
                 downloaded_file_name = None
                 for f_in_dir in os.listdir(TEMP_AUDIO_DIR):
                     if f_in_dir.startswith(video_id + "."):
@@ -144,15 +214,15 @@ def search_and_download():
                         break
                 
                 if not downloaded_file_name:
-                    logger.error(f"Audio file NOT FOUND after download attempt for video ID: {video_id} (expected pattern: {expected_download_path_pattern}*).")
+                    logger.error(f"Audio file NOT FOUND after download attempt for video ID: {video_id} (expected pattern: {video_id}.*).")
                     logger.info(f"Contents of {TEMP_AUDIO_DIR}: {os.listdir(TEMP_AUDIO_DIR)}")
                     last_download_error_message = f"Audio file not found post-download for {video_id}."
-                    continue # Try next song in search_results
+                    continue
 
                 actual_downloaded_path = os.path.join(TEMP_AUDIO_DIR, downloaded_file_name)
                 final_downloaded_ext = downloaded_file_name.split('.')[-1]
-
-                # Rename to unique name before sending
+                
+                unique_temp_filename_base = str(uuid.uuid4())
                 response_file_path = os.path.join(TEMP_AUDIO_DIR, f"{unique_temp_filename_base}.{final_downloaded_ext}")
                 os.rename(actual_downloaded_path, response_file_path)
                 logger.info(f"Renamed downloaded audio from {actual_downloaded_path} to {response_file_path}")
@@ -160,43 +230,30 @@ def search_and_download():
                 final_song_title = current_song_title
                 final_song_artist = current_song_artist
                 downloaded_successfully = True
-                break # Exit loop on first successful download
+                break
 
             except yt_dlp.utils.DownloadError as de_inner:
                 logger.warning(f"yt-dlp DownloadError for '{current_song_title}' (ID: {video_id}): {de_inner}")
                 last_download_error_message = str(de_inner)
-                # (Cleanup of partial files for this video_id already handled at the start of the loop)
-                continue # Try next song
+                continue
             except Exception as e_inner:
                 logger.error(f"Unexpected error during download attempt for '{current_song_title}' (ID: {video_id}): {e_inner}", exc_info=True)
                 last_download_error_message = str(e_inner)
-                continue # Try next song
+                continue
 
         if not downloaded_successfully:
             logger.error(f"All download attempts failed for query '{search_query}'. Last error: {last_download_error_message}")
-            # Provide more specific feedback if known patterns are in the error
-            if "Video unavailable" in last_download_error_message:
-                error_to_report = f"Video unavailable: {last_download_error_message}. This might be due to regional restrictions or the video being removed/private."
-            elif "Sign in to confirm" in last_download_error_message:
-                error_to_report = f"Authentication error: {last_download_error_message}. Cookies might be invalid or required for this content."
-            else:
-                error_to_report = f"Failed to download audio after trying {len(search_results)} result(s). Last error: {last_download_error_message}"
+            error_to_report = f"Failed to download audio after trying {len(search_results)} result(s). Last error: {last_download_error_message}. This may be due to regional restrictions or server IP issues with YouTube."
             return jsonify({"error": error_to_report}), 500
 
-        # Proceed with sending the successfully downloaded file
         logger.info(f"Sending file: {response_file_path} as '{final_song_artist} - {final_song_title}.{final_downloaded_ext}'")
         
         mimetype_map = {
-            'mp3': 'audio/mpeg',
-            'm4a': 'audio/mp4', # or audio/m4a
-            'webm': 'audio/webm',
-            'opus': 'audio/opus',
-            # Add more as needed
+            'mp3': 'audio/mpeg', 'm4a': 'audio/mp4', 'webm': 'audio/webm',
+            'opus': 'audio/opus', 'ogg': 'audio/ogg',
         }
         mimetype = mimetype_map.get(final_downloaded_ext.lower(), 'application/octet-stream')
 
-
-        # Ensure response is created within the try block so cleanup_file is registered
         response = send_file(
             response_file_path,
             as_attachment=True,
@@ -210,19 +267,15 @@ def search_and_download():
                 if os.path.exists(response_file_path):
                     os.remove(response_file_path)
                     logger.info(f"Cleaned up temporary file: {response_file_path}")
-                # else: # No need to warn if file is already gone or never existed here
-                #    logger.warning(f"Cleanup: File not found to delete: {response_file_path}")
             except Exception as e_cleanup:
                 logger.error(f"Error cleaning up file {response_file_path}: {e_cleanup}", exc_info=True)
         
         return response
 
-    except Exception as e_outer: # Catch-all for errors outside the download loop (e.g., YTMusic API search)
+    except Exception as e_outer:
         logger.error(f"An unexpected error occurred in search_and_download: {e_outer}", exc_info=True)
         return jsonify({"error": f"An internal server error occurred: {str(e_outer)}"}), 500
 
-
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5001)) # Default to 5001 if PORT not set
-    # For Render, debug=False is typical. For local dev, debug=True can be helpful.
+    port = int(os.environ.get('PORT', 5001))
     app.run(host='0.0.0.0', port=port, debug=False)
