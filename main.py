@@ -1,21 +1,19 @@
-from flask import Flask, request, send_file, jsonify
+from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 from ytmusicapi import YTMusic
-import yt_dlp
+import yt_dlp # Keep for yt_dlp.utils.DownloadError if needed for error types
 import os
-import uuid
 import logging
 import time
+import json # For SSE data
+import subprocess # For running yt-dlp as a subprocess for streaming
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-# --- MODIFICATION START ---
-# Allow CORS from any origin for all routes
 CORS(app, resources={r"/*": {"origins": "*"}})
-# --- MODIFICATION END ---
 
 # --- YouTube Music API Setup ---
 try:
@@ -23,46 +21,22 @@ try:
     logger.info("YTMusic initialized successfully.")
 except Exception as e:
     logger.error(f"Failed to initialize YTMusic: {e}")
-    # Consider exiting or disabling functionality if YTMusic is critical
 
-# --- yt-dlp Configuration for audio download ---
-
-# Define the name of the temporary directory
-TEMP_AUDIO_DIR_NAME = 'temp_audio'
-# Create an absolute path for the temporary directory.
-# Assumes this script is at the root of your project or CWD is project root.
-TEMP_AUDIO_DIR = os.path.abspath(TEMP_AUDIO_DIR_NAME)
-
-# Ensure the temporary directory exists
-if not os.path.exists(TEMP_AUDIO_DIR):
-    try:
-        os.makedirs(TEMP_AUDIO_DIR)
-        logger.info(f"Created temporary audio directory: {TEMP_AUDIO_DIR}")
-    except Exception as e:
-        logger.error(f"Error creating temporary audio directory {TEMP_AUDIO_DIR}: {e}")
-        # This could be a critical error if the directory cannot be created.
-
-COOKIES_FILE_PATH = 'cookies.txt'  # Assumes cookies.txt is in the root of your project
+# --- yt-dlp Configuration ---
+# No TEMP_AUDIO_DIR needed for streaming
+COOKIES_FILE_PATH = 'cookies.txt'
 absolute_cookies_path = os.path.abspath(COOKIES_FILE_PATH)
 
-YDL_OPTS_BASE = {
-    'format': 'bestaudio/best',
-    'noplaylist': True,
-    'quiet': False,
-    'no_warnings': False,
-    'paths': {'home': TEMP_AUDIO_DIR},  # All output files go into this directory
-    'outtmpl': '%(id)s.%(ext)s',  # Filename template *within* paths.home.
-    # yt-dlp will create e.g., TEMP_AUDIO_DIR/videoid.webm,
-    # and the postprocessor will create TEMP_AUDIO_DIR/videoid.mp3.
-    # 'ffmpeg_location': '/usr/bin/ffmpeg', # COMMENTED OUT: Let yt-dlp find ffmpeg in PATH.
-    # This is usually more robust on Render/PaaS.
-    # If FFmpeg errors occur, ensure it's installed and in PATH.
-    'verbose': True,  # Add verbose logging from yt-dlp for debugging
+# Base yt-dlp options for getting info (not for direct streaming pipe yet)
+YDL_OPTS_INFO = {
+    'quiet': True,
+    'no_warnings': True,
+    'skip_download': True, # We only want info
+    'dumpjson': True, # Get metadata as JSON
 }
-
 if os.path.exists(absolute_cookies_path):
-    logger.info(f"Cookies file found at {absolute_cookies_path}. Adding to yt-dlp options.")
-    YDL_OPTS_BASE['cookiefile'] = absolute_cookies_path
+    YDL_OPTS_INFO['cookiefile'] = absolute_cookies_path
+    logger.info(f"Cookies file found at {absolute_cookies_path}. Using for yt-dlp info.")
 else:
     logger.warning(
         f"Cookies file not found at {absolute_cookies_path}. "
@@ -74,128 +48,160 @@ else:
 def health_check():
     return jsonify({"status": "ok", "message": "Backend is running!"}), 200
 
+def sse_message(data):
+    """Helper to format SSE messages."""
+    return f"data: {json.dumps(data)}\n\n"
 
-@app.route('/search_and_download', methods=['GET'])
-def search_and_download():
+@app.route('/search_and_prepare_song_sse')
+def search_and_prepare_song_sse():
     search_query = request.args.get('query')
     if not search_query:
-        logger.warning("Search query missing.")
-        return jsonify({"error": "Search query is required"}), 400
+        def error_gen():
+            yield sse_message({"status": "error", "message": "Search query is required"})
+        return Response(error_gen(), mimetype='text/event-stream')
 
-    logger.info(f"Received search query: {search_query}")
+    logger.info(f"SSE request for search query: {search_query}")
 
+    def generate_events():
+        try:
+            yield sse_message({"status": "searching", "message": f"Searching for \"{search_query}\"..."})
+            
+            search_results = ytmusic.search(search_query, filter='songs')
+            if not search_results:
+                yield sse_message({"status": "error", "message": f"No songs found for \"{search_query}\""})
+                return
+
+            first_song = search_results[0]
+            video_id = first_song['videoId']
+            song_title = first_song.get('title', 'Unknown Title')
+            song_artist = first_song.get('artists', [{'name': 'Unknown Artist'}])[0]['name']
+            duration_seconds = first_song.get('duration_seconds', 0) # Get duration if available
+            thumbnail_url = first_song.get('thumbnails', [{}])[0].get('url', '')
+
+
+            if not video_id:
+                yield sse_message({"status": "error", "message": "Could not get video ID for the song."})
+                return
+
+            song_details = {
+                "title": song_title,
+                "artist": song_artist,
+                "video_id": video_id,
+                "duration_seconds": duration_seconds,
+                "thumbnail_url": thumbnail_url
+            }
+
+            yield sse_message({
+                "status": "found", 
+                "message": f"Found: {song_title} by {song_artist}",
+                "video_id": video_id, # Redundant here but consistent
+                "song_details": song_details
+            })
+            
+            # Optionally, you could add a step here to verify streamability with yt-dlp --dump-json
+            # For now, assume it's streamable if found by ytmusicapi
+
+            yield sse_message({
+                "status": "ready_to_stream",
+                "message": f"Ready to stream: {song_title}",
+                "video_id": video_id,
+                "song_details": song_details
+            })
+
+        except Exception as e:
+            logger.error(f"Error in SSE generation for '{search_query}': {e}", exc_info=True)
+            yield sse_message({"status": "error", "message": f"An unexpected error occurred: {str(e)}"})
+
+    return Response(generate_events(), mimetype='text/event-stream')
+
+
+@app.route('/stream_audio/<video_id>')
+def stream_audio(video_id):
+    if not video_id:
+        return jsonify({"error": "Video ID is required"}), 400
+
+    logger.info(f"Request to stream audio for video_id: {video_id}")
+
+    # yt-dlp command for streaming
+    # We want raw audio data, 'bestaudio' is usually opus in webm or aac in m4a.
+    # `-f bestaudio` picks the best audio-only format.
+    # `-o -` outputs to stdout.
+    command = [
+        'yt-dlp',
+        '-f', 'bestaudio', # Or 'bestaudio[ext=m4a]', 'bestaudio[ext=webm]' if you want to force
+        '-o', '-',       # Output to stdout
+        '--quiet',       # Suppress yt-dlp console output to keep stdout clean for audio
+        '--no-warnings',
+        f'https://music.youtube.com/watch?v={video_id}'
+    ]
+
+    if os.path.exists(absolute_cookies_path):
+        command.extend(['--cookies', absolute_cookies_path])
+        logger.info(f"Using cookies for streaming video_id: {video_id}")
+
+    logger.info(f"Streaming command: {' '.join(command)}")
+    
     try:
-        logger.info(f"Searching for: {search_query}")
-        search_results = ytmusic.search(search_query, filter='songs')
+        # Start the yt-dlp process
+        # bufsize=-1 means use system default, usually fully buffered. For streaming, smaller might be better
+        # but Popen's stdout is a pipe, so it should be fine.
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-        if not search_results:
-            logger.warning(f"No songs found for query: {search_query}")
-            return jsonify({"error": "No songs found for your query"}), 404
-
-        first_song = search_results[0]
-        video_id = first_song['videoId']
-        song_title = first_song.get('title', 'Unknown Title')
-        song_artist = first_song.get('artists', [{'name': 'Unknown Artist'}])[0]['name']
-        logger.info(f"Found song: {song_title} by {song_artist} (ID: {video_id})")
-
-        if not video_id:
-            logger.error("Could not get video ID for the song.")
-            return jsonify({"error": "Could not get video ID for the song"}), 500
-
-        unique_audio_filename = f"{str(uuid.uuid4())}"
-        final_audio_path = os.path.join(TEMP_AUDIO_DIR, unique_audio_filename)
-
-        # This is the path where yt-dlp will place the downloaded audio.
-        expected_downloaded_audio_path = os.path.join(TEMP_AUDIO_DIR, f"{video_id}")
-        logger.info(f"Expecting audio at: {expected_downloaded_audio_path}")
-
-        # Clean up any pre-existing file with the same video_id or unique name from a failed previous run
-        for path_to_clean in [expected_downloaded_audio_path, final_audio_path]: # This logic is a bit flawed as extensions aren't known yet
-            if os.path.exists(path_to_clean): # If it exists without extension, it's likely a leftover directory or misnamed file
-                try:
-                    if os.path.isfile(path_to_clean):
-                        os.remove(path_to_clean)
-                        logger.info(f"Removed pre-existing file: {path_to_clean}")
-                    # Could also check for os.path.isdir and remove if it's an empty dir from a failed -o %(id)s/ format
-                except Exception as e:
-                    logger.warning(f"Could not remove pre-existing file {path_to_clean}: {e}")
-
-        # Use a fresh copy of YDL_OPTS_BASE for this download instance
-        ydl_opts_specific = YDL_OPTS_BASE.copy()
-        # Note: The `outtmpl` in YDL_OPTS_BASE is '%(id)s.%(ext)s'.
-        # This means yt-dlp will try to create a file like 'BciS5krYL80.webm'
-        # directly inside TEMP_AUDIO_DIR (which is paths['home']).
-
-        with yt_dlp.YoutubeDL(ydl_opts_specific) as ydl:
-            logger.info(f"Starting download for video ID: {video_id} with options: {ydl_opts_specific}")
-            download_url = f'https://music.youtube.com/watch?v={video_id}' # Using music.youtube.com URL
-            ydl.download([download_url])
-            # The log from yt-dlp itself (with verbose:True) should now show the correct destination path.
-            logger.info(f"Download process reported as complete for video ID: {video_id}.")
-
-        # Determine the actual downloaded file extension
-        downloaded_file_ext = None
-        # The `expected_downloaded_audio_path` was defined as os.path.join(TEMP_AUDIO_DIR, f"{video_id}")
-        # So we are looking for files like TEMP_AUDIO_DIR/video_id.some_extension
-        for filename in os.listdir(TEMP_AUDIO_DIR):
-            if filename.startswith(video_id + "."): # Correctly checking for video_id.ext
-                downloaded_file_ext = filename.split('.')[-1] # Get the last part after the dot
-                break
-
-        if not downloaded_file_ext:
-            logger.error(f"Audio file NOT FOUND after download for video ID: {video_id}")
-            logger.info(f"Contents of {TEMP_AUDIO_DIR}: {os.listdir(TEMP_AUDIO_DIR)}")  # List dir contents
-            return jsonify({"error": "Critical error: Audio file not found after download. Check logs."}), 500
-
-        # Reconstruct the full path to the downloaded file
-        actual_downloaded_file_path = os.path.join(TEMP_AUDIO_DIR, f"{video_id}.{downloaded_file_ext}")
-        # The `final_audio_path` was os.path.join(TEMP_AUDIO_DIR, unique_audio_filename) (no extension yet)
-        # So the renamed path will be os.path.join(TEMP_AUDIO_DIR, unique_audio_filename + "." + downloaded_file_ext)
-        renamed_audio_path = f"{final_audio_path}.{downloaded_file_ext}" # Add extension to the unique name
-
-        if not os.path.exists(actual_downloaded_file_path):
-            logger.error(f"Downloaded audio file NOT FOUND at expected path: {actual_downloaded_file_path}")
-            logger.info(f"Contents of {TEMP_AUDIO_DIR}: {os.listdir(TEMP_AUDIO_DIR)}")
-            return jsonify({"error": "Critical error: Downloaded audio file not found. Check logs."}), 500
-
-        # Rename the downloaded audio file to a unique name before sending
-        os.rename(actual_downloaded_file_path, renamed_audio_path)
-        logger.info(f"Renamed downloaded audio from {actual_downloaded_file_path} to {renamed_audio_path}")
-
-        logger.info(f"Sending file: {renamed_audio_path}")
-        response = send_file(
-            renamed_audio_path,
-            as_attachment=True,
-            download_name=f"{song_artist} - {song_title}.{downloaded_file_ext}",
-            mimetype='audio/mpeg' if downloaded_file_ext == 'mp3' else 'audio/webm' # Adjust mimetype as needed
-        )
-
-        @response.call_on_close
-        def cleanup_file():
+        # Stream the output
+        @stream_with_context
+        def generate_audio_chunks():
             try:
-                if os.path.exists(renamed_audio_path):
-                    os.remove(renamed_audio_path)
-                    logger.info(f"Cleaned up temporary file: {renamed_audio_path}")
+                logger.info(f"Starting to stream chunks for {video_id}")
+                # Read and yield chunks from yt-dlp's stdout
+                for chunk in iter(lambda: process.stdout.read(8192), b''): # Read in 8KB chunks
+                    yield chunk
+                logger.info(f"Finished yielding chunks for {video_id}. Waiting for process to exit.")
+                process.stdout.close() # Ensure stdout is closed
+                process.wait() # Wait for the process to terminate
+            except Exception as gen_exc:
+                logger.error(f"Error during audio chunk generation for {video_id}: {gen_exc}", exc_info=True)
+            finally:
+                # Ensure the process is terminated when streaming is done or client disconnects
+                if process.poll() is None: # If process is still running
+                    logger.warning(f"yt-dlp process for {video_id} still running after stream. Terminating.")
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        logger.warning(f"yt-dlp process for {video_id} did not terminate gracefully. Killing.")
+                        process.kill()
+                
+                stderr_output = process.stderr.read().decode(errors='ignore').strip()
+                if stderr_output:
+                    # Log as warning if it's just info, error if return code is non-zero
+                    if process.returncode != 0:
+                        logger.error(f"yt-dlp stderr for {video_id} (code {process.returncode}): {stderr_output}")
+                    else:
+                        logger.info(f"yt-dlp stderr for {video_id} (code {process.returncode}): {stderr_output}") # Some formats print info to stderr
                 else:
-                    logger.warning(f"Cleanup: File not found to delete: {renamed_audio_path}")
-            except Exception as e:
-                logger.error(f"Error cleaning up file {renamed_audio_path}: {e}")
+                     logger.info(f"yt-dlp process for {video_id} exited with code {process.returncode}. No stderr output.")
+                process.stderr.close()
 
-        return response
+        # Mimetype: 'bestaudio' usually results in WebM (Opus) or M4A (AAC).
+        # Modern browsers are good at sniffing. 'audio/webm' or 'audio/aac' or 'application/octet-stream'
+        # Let's try 'audio/webm' as a common default from 'bestaudio'.
+        # If issues, 'application/octet-stream' is safer and lets browser decide.
+        # Or, one could run `yt-dlp --print-json` in the SSE step to get the exact extension and pass it.
+        return Response(generate_audio_chunks(), mimetype='audio/webm')
 
-    except yt_dlp.utils.DownloadError as de:
+    except yt_dlp.utils.DownloadError as de: # This might not be caught here if subprocess fails
         error_message = str(de)
-        logger.error(f"yt-dlp DownloadError: {error_message}", exc_info=True)
+        logger.error(f"yt-dlp DownloadError during stream setup for {video_id}: {error_message}", exc_info=True)
         if "Sign in to confirm" in error_message:
-            logger.error("Authentication error: Cookies might be invalid, expired, or not correctly applied.")
-            return jsonify({"error": "Failed to download due to authentication issue. Cookies might be required or invalid."}), 500
-        # The "Video unavailable" error would be caught here
-        return jsonify({"error": f"Failed to download audio: {error_message}"}), 500
+             return jsonify({"error": "Failed to stream due to authentication issue. Cookies might be required or invalid."}), 500
+        return jsonify({"error": f"Failed to stream audio: {error_message}"}), 500
     except Exception as e:
-        logger.error(f"An unexpected error occurred: {e}", exc_info=True)
-        return jsonify({"error": f"An internal server error occurred: {str(e)}"}), 500
+        logger.error(f"Error starting yt-dlp stream process for {video_id}: {e}", exc_info=True)
+        return jsonify({"error": f"Failed to start audio stream: {str(e)}"}), 500
 
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5001))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    # debug=True can cause issues with subprocesses and SSE in some environments.
+    # Use threaded=True for handling multiple requests like SSE and audio stream.
+    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
