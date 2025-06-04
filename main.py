@@ -1,52 +1,73 @@
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 from ytmusicapi import YTMusic
-import yt_dlp # Keep for yt_dlp.utils.DownloadError if needed for error types
+import yt_dlp # For metadata and getting stream URL
 import os
 import logging
 import time
-import json # For SSE data
-import subprocess # For running yt-dlp as a subprocess for streaming
+import json
+import subprocess
 
 # --- Logging Setup ---
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
+CORS(app, resources={r"/*": {"origins": "*"}}) # Allow all for development, restrict in production
 
 # --- YouTube Music API Setup ---
 try:
     ytmusic = YTMusic()
     logger.info("YTMusic initialized successfully.")
 except Exception as e:
-    logger.error(f"Failed to initialize YTMusic: {e}")
+    logger.error(f"Failed to initialize YTMusic: {e}", exc_info=True)
+    # Potentially exit or disable music features if YTMusic is critical
+    # raise SystemExit(f"Could not initialize YTMusic: {e}") from e
 
-# --- yt-dlp Configuration ---
-# No TEMP_AUDIO_DIR needed for streaming
 COOKIES_FILE_PATH = 'cookies.txt'
 absolute_cookies_path = os.path.abspath(COOKIES_FILE_PATH)
 
-# Base yt-dlp options for getting info (not for direct streaming pipe yet)
-YDL_OPTS_INFO = {
-    'quiet': True,
-    'no_warnings': True,
-    'skip_download': True, # We only want info
-    'dumpjson': True, # Get metadata as JSON
-}
-if os.path.exists(absolute_cookies_path):
-    YDL_OPTS_INFO['cookiefile'] = absolute_cookies_path
-    logger.info(f"Cookies file found at {absolute_cookies_path}. Using for yt-dlp info.")
-else:
-    logger.warning(
-        f"Cookies file not found at {absolute_cookies_path}. "
-        f"yt-dlp will run without cookies. This may lead to 'Sign in to confirm' errors."
-    )
+# --- Helper for yt-dlp options ---
+def get_ydl_opts(extra_opts=None):
+    opts = {
+        'quiet': False, # Set to False initially for more verbose yt-dlp output for debugging
+        'no_warnings': False,
+        # 'verbose': True, # Uncomment for maximum debugging from yt-dlp
+    }
+    if os.path.exists(absolute_cookies_path):
+        opts['cookiefile'] = absolute_cookies_path
+        logger.info(f"Using cookies file: {absolute_cookies_path}")
+    else:
+        logger.warning(f"Cookies file not found at {absolute_cookies_path}. Download quality/availability may be affected.")
+    if extra_opts:
+        opts.update(extra_opts)
+    return opts
+
+def _build_yt_dlp_command(base_command_list, opts_dict):
+    cmd = list(base_command_list) # Start with base like ['yt-dlp']
+    for k, v in opts_dict.items():
+        if k == 'cookiefile' and not os.path.exists(v): # Skip cookiefile if it doesn't exist
+            logger.warning(f"Skipping non-existent cookiefile for yt-dlp command: {v}")
+            continue
+        if isinstance(v, bool):
+            if v: # True for flags like --quiet, --get-url
+                if k in ['get-url', 'dump-json', 'skip-download', 'quiet', 'no-warnings', 'verbose', 'noplaylist']: # Common flags
+                     cmd.append(f'--{k.replace("_", "-")}')
+                else: # Less common boolean flags, assume they are just flags
+                     cmd.append(f'--{k.replace("_", "-")}')
+        elif isinstance(v, (str, int, float)): # For options like --format <value>, --output <value>
+            cmd.append(f'--{k.replace("_", "-")}')
+            cmd.append(str(v))
+        elif isinstance(v, list): # For options that can be repeated or take list
+            for item in v:
+                cmd.append(f'--{k.replace("_", "-")}')
+                cmd.append(str(item))
+    return cmd
 
 
 @app.route('/')
 def health_check():
-    return jsonify({"status": "ok", "message": "Backend is running!"}), 200
+    return jsonify({"status": "ok", "message": "Backend is running and ready to stream!"}), 200
 
 def sse_message(data):
     """Helper to format SSE messages."""
@@ -60,57 +81,100 @@ def search_and_prepare_song_sse():
             yield sse_message({"status": "error", "message": "Search query is required"})
         return Response(error_gen(), mimetype='text/event-stream')
 
-    logger.info(f"SSE request for search query: {search_query}")
+    logger.info(f"SSE: Preparing song for query: \"{search_query}\"")
 
     def generate_events():
         try:
             yield sse_message({"status": "searching", "message": f"Searching for \"{search_query}\"..."})
             
-            search_results = ytmusic.search(search_query, filter='songs')
+            search_results = ytmusic.search(search_query, filter='songs') # Can add more types if needed
             if not search_results:
+                logger.warning(f"SSE: No songs found via YTMusic API for \"{search_query}\"")
                 yield sse_message({"status": "error", "message": f"No songs found for \"{search_query}\""})
                 return
 
-            first_song = search_results[0]
-            video_id = first_song['videoId']
-            song_title = first_song.get('title', 'Unknown Title')
-            song_artist = first_song.get('artists', [{'name': 'Unknown Artist'}])[0]['name']
-            duration_seconds = first_song.get('duration_seconds', 0) # Get duration if available
-            thumbnail_url = first_song.get('thumbnails', [{}])[0].get('url', '')
-
-
+            first_song_ytmusic = search_results[0]
+            video_id = first_song_ytmusic['videoId']
+            
             if not video_id:
+                logger.error(f"SSE: YTMusic API found a result but no videoId for \"{search_query}\"")
                 yield sse_message({"status": "error", "message": "Could not get video ID for the song."})
                 return
+
+            yield sse_message({"status": "found_initial", "message": f"Initial match: {first_song_ytmusic.get('title', 'Unknown Title')}. Fetching details..."})
+
+            # Use yt-dlp to get more accurate metadata and confirm availability
+            stream_url_for_info = f'https://music.youtube.com/watch?v={video_id}'
+            ydl_info_opts = get_ydl_opts({
+                'format': 'bestaudio/best', 
+                'dump_json': True,      # Corrected from dumpjson
+                'skip_download': True,
+                'noplaylist': True,
+            })
+            
+            # Build command carefully
+            yt_dlp_info_command = _build_yt_dlp_command(['yt-dlp'], ydl_info_opts)
+            yt_dlp_info_command.append(stream_url_for_info)
+
+            logger.info(f"SSE: Fetching metadata with yt-dlp for {video_id}: {' '.join(yt_dlp_info_command)}")
+            process = subprocess.Popen(yt_dlp_info_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            stdout, stderr = process.communicate(timeout=30) # Added timeout
+
+            if process.returncode != 0:
+                err_msg = stderr.decode(errors='ignore').strip()
+                logger.error(f"SSE: yt-dlp metadata fetch error for {video_id} (Code {process.returncode}): {err_msg}")
+                yield sse_message({"status": "error", "message": f"Error fetching song details: {err_msg or 'Video unavailable or restricted.'}"})
+                return
+            
+            try:
+                metadata = json.loads(stdout)
+            except json.JSONDecodeError as je:
+                logger.error(f"SSE: Failed to parse yt-dlp JSON output for {video_id}: {je}\nOutput: {stdout[:500]}")
+                yield sse_message({"status": "error", "message": "Error processing song details (JSON parse failed)."})
+                return
+
+            # Prioritize metadata from yt-dlp
+            song_title = metadata.get('title', first_song_ytmusic.get('title', 'Unknown Title'))
+            song_artist = metadata.get('artist') or metadata.get('channel') or metadata.get('uploader', 
+                            (first_song_ytmusic.get('artists', [{'name': 'Unknown Artist'}])[0]['name'] 
+                             if first_song_ytmusic.get('artists') else 'Unknown Artist'))
+            duration_seconds = metadata.get('duration', first_song_ytmusic.get('duration_seconds', 0))
+            
+            thumbnails_yt_dlp = metadata.get('thumbnails', [])
+            thumbnail_url = thumbnails_yt_dlp[-1]['url'] if thumbnails_yt_dlp else \
+                            (first_song_ytmusic.get('thumbnails', [{}])[0].get('url', ''))
+
 
             song_details = {
                 "title": song_title,
                 "artist": song_artist,
-                "video_id": video_id,
+                "video_id": video_id, # This is the key for streaming
                 "duration_seconds": duration_seconds,
-                "thumbnail_url": thumbnail_url
+                "thumbnail_url": thumbnail_url,
+                "original_query": search_query # Important for frontend matching, esp. for prefetch
             }
-
+            
             yield sse_message({
-                "status": "found", 
-                "message": f"Found: {song_title} by {song_artist}",
-                "video_id": video_id, # Redundant here but consistent
+                "status": "found_detailed", # New status
+                "message": f"Details acquired: {song_title} by {song_artist}",
                 "song_details": song_details
             })
             
-            # Optionally, you could add a step here to verify streamability with yt-dlp --dump-json
-            # For now, assume it's streamable if found by ytmusicapi
-
             yield sse_message({
                 "status": "ready_to_stream",
                 "message": f"Ready to stream: {song_title}",
-                "video_id": video_id,
                 "song_details": song_details
             })
 
+        except subprocess.TimeoutExpired:
+            logger.error(f"SSE: yt-dlp metadata fetch timed out for \"{search_query}\"")
+            yield sse_message({"status": "error", "message": "Fetching song details timed out."})
+        except yt_dlp.utils.DownloadError as de:
+            logger.error(f"SSE: yt-dlp DownloadError during prep for \"{search_query}\": {de}", exc_info=True)
+            yield sse_message({"status": "error", "message": f"Download error preparing song: {str(de)}"})
         except Exception as e:
-            logger.error(f"Error in SSE generation for '{search_query}': {e}", exc_info=True)
-            yield sse_message({"status": "error", "message": f"An unexpected error occurred: {str(e)}"})
+            logger.error(f"SSE: Unexpected error in generate_events for \"{search_query}\": {e}", exc_info=True)
+            yield sse_message({"status": "error", "message": f"An unexpected server error occurred preparing the song."})
 
     return Response(generate_events(), mimetype='text/event-stream')
 
@@ -120,88 +184,125 @@ def stream_audio(video_id):
     if not video_id:
         return jsonify({"error": "Video ID is required"}), 400
 
-    logger.info(f"Request to stream audio for video_id: {video_id}")
+    start_time_str = request.args.get('startTime', '0')
+    try:
+        start_time = float(start_time_str)
+        if start_time < 0: start_time = 0
+    except ValueError:
+        start_time = 0
 
-    # yt-dlp command for streaming
-    # We want raw audio data, 'bestaudio' is usually opus in webm or aac in m4a.
-    # `-f bestaudio` picks the best audio-only format.
-    # `-o -` outputs to stdout.
-    command = [
-        'yt-dlp',
-        '-f', 'bestaudio', # Or 'bestaudio[ext=m4a]', 'bestaudio[ext=webm]' if you want to force
-        '-o', '-',       # Output to stdout
-        '--quiet',       # Suppress yt-dlp console output to keep stdout clean for audio
-        '--no-warnings',
-        f'https://music.youtube.com/watch?v={video_id}'
-    ]
+    logger.info(f"STREAM: Request for video_id: {video_id}, startTime: {start_time:.2f}s")
 
-    if os.path.exists(absolute_cookies_path):
-        command.extend(['--cookies', absolute_cookies_path])
-        logger.info(f"Using cookies for streaming video_id: {video_id}")
-
-    logger.info(f"Streaming command: {' '.join(command)}")
+    # Step 1: Get the direct audio stream URL using yt-dlp
+    ydl_url_opts = get_ydl_opts({
+        'format': 'bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio',
+        'get_url': True, # Corrected: underscore for internal key, becomes --get-url
+        'noplaylist': True,
+    })
+    
+    yt_dlp_get_url_command = _build_yt_dlp_command(['yt-dlp'], ydl_url_opts)
+    yt_dlp_get_url_command.append(f'https://music.youtube.com/watch?v={video_id}')
+    
+    logger.info(f"STREAM: yt-dlp get URL command: {' '.join(yt_dlp_get_url_command)}")
     
     try:
-        # Start the yt-dlp process
-        # bufsize=-1 means use system default, usually fully buffered. For streaming, smaller might be better
-        # but Popen's stdout is a pipe, so it should be fine.
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        direct_stream_url_process = subprocess.Popen(yt_dlp_get_url_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdout_url, stderr_url = direct_stream_url_process.communicate(timeout=20) # Timeout for getting URL
 
-        # Stream the output
-        @stream_with_context
-        def generate_audio_chunks():
-            try:
-                logger.info(f"Starting to stream chunks for {video_id}")
-                # Read and yield chunks from yt-dlp's stdout
-                for chunk in iter(lambda: process.stdout.read(8192), b''): # Read in 8KB chunks
-                    yield chunk
-                logger.info(f"Finished yielding chunks for {video_id}. Waiting for process to exit.")
-                process.stdout.close() # Ensure stdout is closed
-                process.wait() # Wait for the process to terminate
-            except Exception as gen_exc:
-                logger.error(f"Error during audio chunk generation for {video_id}: {gen_exc}", exc_info=True)
-            finally:
-                # Ensure the process is terminated when streaming is done or client disconnects
-                if process.poll() is None: # If process is still running
-                    logger.warning(f"yt-dlp process for {video_id} still running after stream. Terminating.")
-                    process.terminate()
-                    try:
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        logger.warning(f"yt-dlp process for {video_id} did not terminate gracefully. Killing.")
-                        process.kill()
-                
-                stderr_output = process.stderr.read().decode(errors='ignore').strip()
-                if stderr_output:
-                    # Log as warning if it's just info, error if return code is non-zero
-                    if process.returncode != 0:
-                        logger.error(f"yt-dlp stderr for {video_id} (code {process.returncode}): {stderr_output}")
-                    else:
-                        logger.info(f"yt-dlp stderr for {video_id} (code {process.returncode}): {stderr_output}") # Some formats print info to stderr
-                else:
-                     logger.info(f"yt-dlp process for {video_id} exited with code {process.returncode}. No stderr output.")
-                process.stderr.close()
+        if direct_stream_url_process.returncode != 0:
+            error_message = stderr_url.decode(errors='ignore').strip()
+            logger.error(f"STREAM: yt-dlp failed to get stream URL for {video_id}. Code: {direct_stream_url_process.returncode}. Error: {error_message}")
+            # Consider returning a 5xx error with a JSON body for the client to handle
+            return Response(f"Error: Could not get stream URL. yt-dlp: {error_message}", status=502, mimetype='text/plain')
 
-        # Mimetype: 'bestaudio' usually results in WebM (Opus) or M4A (AAC).
-        # Modern browsers are good at sniffing. 'audio/webm' or 'audio/aac' or 'application/octet-stream'
-        # Let's try 'audio/webm' as a common default from 'bestaudio'.
-        # If issues, 'application/octet-stream' is safer and lets browser decide.
-        # Or, one could run `yt-dlp --print-json` in the SSE step to get the exact extension and pass it.
-        return Response(generate_audio_chunks(), mimetype='audio/webm')
 
-    except yt_dlp.utils.DownloadError as de: # This might not be caught here if subprocess fails
-        error_message = str(de)
-        logger.error(f"yt-dlp DownloadError during stream setup for {video_id}: {error_message}", exc_info=True)
-        if "Sign in to confirm" in error_message:
-             return jsonify({"error": "Failed to stream due to authentication issue. Cookies might be required or invalid."}), 500
-        return jsonify({"error": f"Failed to stream audio: {error_message}"}), 500
+        direct_audio_url = stdout_url.decode().strip()
+        if not direct_audio_url.startswith(('http://', 'https://')):
+            logger.error(f"STREAM: yt-dlp returned invalid URL for {video_id}: '{direct_audio_url[:200]}'") # Log more of the URL
+            return Response("Error: yt-dlp returned an invalid stream URL.", status=502, mimetype='text/plain')
+            
+        logger.info(f"STREAM: Obtained direct audio URL for {video_id} (first 100 chars): {direct_audio_url[:100]}...")
+    except subprocess.TimeoutExpired:
+        logger.error(f"STREAM: yt-dlp get URL timed out for {video_id}")
+        return Response("Error: Getting stream URL timed out.", status=504, mimetype='text/plain')
     except Exception as e:
-        logger.error(f"Error starting yt-dlp stream process for {video_id}: {e}", exc_info=True)
-        return jsonify({"error": f"Failed to start audio stream: {str(e)}"}), 500
+        logger.error(f"STREAM: Exception getting URL for {video_id}: {e}", exc_info=True)
+        return Response(f"Error: Server issue getting stream URL. {e}", status=500, mimetype='text/plain')
+
+    # Step 2: Use ffmpeg to stream this URL
+    ffmpeg_cmd = [
+        'ffmpeg',
+        '-nostats', '-hide_banner',
+        '-loglevel', 'warning', # 'error' or 'warning' for less verbosity in logs
+    ]
+    if start_time > 0.1: # Add seek only if significant to avoid issues with 0
+        ffmpeg_cmd.extend(['-ss', str(start_time)]) 
+    
+    ffmpeg_cmd.extend([
+        '-i', direct_audio_url,
+        '-vn',                  # No video
+        '-c:a', 'copy',         # Attempt to copy codec (fastest if compatible)
+        '-movflags', 'frag_keyframe+empty_moov', # For fMP4-like behavior if outputting to MP4-ish
+        '-f', 'webm',           # Output WebM (good for Opus, which bestaudio often is)
+                                # Browsers handle 'audio/webm' well.
+        'pipe:1'                # Output to stdout
+    ])
+
+    logger.info(f"STREAM: ffmpeg command: {' '.join(ffmpeg_cmd)}")
+    
+    try:
+        # bufsize=-1 for system default (often fully buffered).
+        # Smaller bufsize like 8192 might send initial data faster but has more overhead.
+        ffmpeg_process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=8192)
+    except FileNotFoundError:
+        logger.critical("STREAM: ffmpeg command not found. Ensure ffmpeg is installed and in PATH.")
+        return Response("Error: ffmpeg not found on server.", status=503, mimetype='text/plain')
+    except Exception as e:
+        logger.error(f"STREAM: Failed to start ffmpeg process for {video_id}: {e}", exc_info=True)
+        return Response(f"Error: Could not start streaming process. {e}", status=500, mimetype='text/plain')
+
+
+    @stream_with_context
+    def generate_audio_chunks():
+        # This generator is crucial. It runs in a separate context,
+        # allowing the main Flask thread to handle other requests.
+        # The `finally` block ensures cleanup even if the client disconnects.
+        try:
+            logger.info(f"STREAM: ffmpeg - Starting to yield chunks for {video_id} from {start_time:.2f}s")
+            for chunk in iter(lambda: ffmpeg_process.stdout.read(8192), b''):
+                yield chunk
+            logger.info(f"STREAM: ffmpeg - Finished yielding chunks for {video_id}.")
+        except BrokenPipeError: # Client disconnected
+            logger.warning(f"STREAM: ffmpeg - BrokenPipeError for {video_id}. Client likely disconnected.")
+        except Exception as gen_exc:
+            logger.error(f"STREAM: ffmpeg - Error during audio chunk generation for {video_id}: {gen_exc}", exc_info=True)
+        finally:
+            logger.info(f"STREAM: ffmpeg - Cleaning up process for {video_id}")
+            if ffmpeg_process.stdout:
+                ffmpeg_process.stdout.close()
+            if ffmpeg_process.stderr:
+                stderr_output = ffmpeg_process.stderr.read().decode(errors='ignore').strip()
+                if stderr_output:
+                    logger.warning(f"STREAM: ffmpeg stderr for {video_id}: {stderr_output}")
+                ffmpeg_process.stderr.close()
+            
+            if ffmpeg_process.poll() is None: # If process still running
+                logger.warning(f"STREAM: ffmpeg - Process for {video_id} still running, attempting to terminate.")
+                ffmpeg_process.terminate()
+                try:
+                    ffmpeg_process.wait(timeout=5) # Wait for termination
+                except subprocess.TimeoutExpired:
+                    logger.error(f"STREAM: ffmpeg - Process for {video_id} did not terminate gracefully. Killing.")
+                    ffmpeg_process.kill()
+            logger.info(f"STREAM: ffmpeg - Cleanup complete for {video_id}. Exit code: {ffmpeg_process.returncode}")
+
+    # Mimetype should match the -f format in ffmpeg command
+    return Response(generate_audio_chunks(), mimetype='audio/webm')
 
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5001))
-    # debug=True can cause issues with subprocesses and SSE in some environments.
-    # Use threaded=True for handling multiple requests like SSE and audio stream.
+    # For production, use a proper WSGI server like Gunicorn or Uvicorn.
+    # threaded=True helps Flask dev server handle concurrent requests like SSE and audio streams.
+    # debug=False is recommended for stability with subprocesses in threaded mode.
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
