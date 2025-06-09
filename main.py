@@ -35,17 +35,16 @@ absolute_cookies_path = os.path.abspath(COOKIES_FILE_PATH)
 def cleanup_old_files():
     """Cleans up audio files older than 1 hour."""
     while True:
+        time.sleep(600)  # Run cleanup every 10 minutes
         try:
             for filename in os.listdir(TEMP_DIR):
                 file_path = os.path.join(TEMP_DIR, filename)
                 if os.path.isfile(file_path):
-                    # Check if the file is older than 3600 seconds (1 hour)
                     if (time.time() - os.path.getmtime(file_path)) > 3600:
                         os.remove(file_path)
                         logger.info(f"Cleaned up old file: {filename}")
         except Exception as e:
             logger.error(f"Error during file cleanup: {e}")
-        time.sleep(600) # Run cleanup every 10 minutes
 
 # --- Main Endpoints ---
 @app.route('/')
@@ -61,52 +60,52 @@ def prepare_song():
     logger.info(f"PREPARE: Request received for query: \"{search_query}\"")
 
     try:
-        # Step 1: Search for the song to get its video ID and metadata
-        with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True, 'default_search': 'ytsearch1'}) as ydl:
-            search_results = ydl.extract_info(search_query, download=False)
-            if not search_results.get('entries'):
-                logger.warning(f"PREPARE: No results found for \"{search_query}\"")
-                return jsonify({"error": f"No results found for '{search_query}'"}), 404
-            
-            info = search_results['entries'][0]
-            video_id = info.get('id')
-            if not video_id:
-                return jsonify({"error": "Could not extract video ID from search result."}), 500
-
-        # Create a unique filename for the downloaded audio
+        # Create a unique filename for the eventual download
         unique_id = str(uuid.uuid4())
-        # Use a compatible extension like .webm which yt-dlp prefers for bestaudio
         output_filename = f"{unique_id}.webm"
         output_path = os.path.join(TEMP_DIR, output_filename)
 
-        # Step 2: Set up yt-dlp options for downloading
+        # --- CORE FIX: Combine Search & Download into a single atomic operation ---
         ydl_opts = {
             'format': 'bestaudio[ext=webm]/bestaudio/best',
-            'outtmpl': output_path,
+            'outtmpl': output_path, # Tell it where to save the file
             'quiet': True,
             'no_warnings': True,
             'noplaylist': True,
+            'default_search': 'ytsearch1', # Search for 1 result
         }
+
+        # Add cookies if the file exists. This is now used for the initial search AND download.
         if os.path.exists(absolute_cookies_path):
+            logger.info("Using cookies file for download operation.")
             ydl_opts['cookiefile'] = absolute_cookies_path
+        else:
+            logger.warning("cookies.txt not found. Authentication may fail.")
 
-        # Step 3: Download the audio file
-        logger.info(f"DOWNLOAD: Starting download for {video_id} to {output_path}")
+        logger.info(f"DOWNLOAD: Starting search and download for: \"{search_query}\"")
+
+        # Use 'with' to ensure resources are managed correctly
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([f'https://www.youtube.com/watch?v={video_id}'])
-        
-        logger.info(f"DOWNLOAD: Finished download for {video_id}")
+            # This call will now search AND download in one step, using the cookies
+            info = ydl.extract_info(search_query, download=True)
+            # The info dict for the downloaded file is in the 'entries' list
+            if not info.get('entries'):
+                raise yt_dlp.utils.DownloadError("No video found from search.")
+            
+            # Since we searched for one, it's the first entry
+            song_info = info['entries'][0]
 
-        # Step 4: Prepare the response for the frontend
+        logger.info(f"DOWNLOAD: Finished download for \"{search_query}\"")
+
+        # Prepare the response for the frontend
         song_details = {
-            "title": info.get('title', 'Unknown Title'),
-            "artist": info.get('artist') or info.get('channel') or 'Unknown Artist',
-            "video_id": video_id,
-            "duration_seconds": info.get('duration', 0),
-            "thumbnail_url": info.get('thumbnails', [{}])[-1].get('url', ''),
+            "title": song_info.get('title', 'Unknown Title'),
+            "artist": song_info.get('artist') or song_info.get('channel') or 'Unknown Artist',
+            "video_id": song_info.get('id'),
+            "duration_seconds": song_info.get('duration', 0),
+            "thumbnail_url": song_info.get('thumbnail', ''), # yt-dlp uses 'thumbnail' key here
         }
 
-        # The URL the frontend will use to fetch the downloaded file
         play_url = f"/audio/{output_filename}"
 
         return jsonify({
@@ -120,10 +119,10 @@ def prepare_song():
         error_string = str(de).lower()
         if 'sign in' in error_string or 'authentication' in error_string:
             logger.error(f"PREPARE: Authentication error for \"{search_query}\".")
-            return jsonify({"error": "Authentication Error: Your cookies.txt file may be invalid."}), 403
+            return jsonify({"error": "Authentication Error: Your cookies.txt file may be invalid or expired."}), 403
         else:
             logger.error(f"PREPARE: yt-dlp DownloadError for \"{search_query}\": {de}")
-            return jsonify({"error": "A download error occurred."}), 500
+            return jsonify({"error": "A download error occurred while fetching the song."}), 500
     except Exception as e:
         logger.error(f"PREPARE: Unexpected error for \"{search_query}\": {e}", exc_info=True)
         return jsonify({"error": "An unexpected server error occurred."}), 500
@@ -135,10 +134,7 @@ def serve_audio(filename):
     return send_from_directory(TEMP_DIR, filename, as_attachment=False)
 
 if __name__ == '__main__':
-    # Start the cleanup thread
     cleanup_thread = Thread(target=cleanup_old_files, daemon=True)
     cleanup_thread.start()
-    
     port = int(os.environ.get('PORT', 5001))
-    # Use a production-ready server like gunicorn or waitress instead of app.run in production
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
