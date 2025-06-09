@@ -6,7 +6,6 @@ import os
 import logging
 import json
 import subprocess
-import time
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
@@ -17,9 +16,8 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 
 # --- YouTube Music API Setup ---
 try:
-    # Using a brand header is good practice if you have one, otherwise default is fine
-    ytmusic = YTMusic(requests_session=True)
-    logger.info("YTMusic initialized successfully with a persistent session.")
+    ytmusic = YTMusic()
+    logger.info("YTMusic initialized successfully.")
 except Exception as e:
     logger.error(f"Failed to initialize YTMusic: {e}", exc_info=True)
 
@@ -33,12 +31,17 @@ def get_ydl_opts(extra_opts=None):
         'no_warnings': True,
         'format': 'bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best',
         'noplaylist': True,
-        'retries': 10,
-        'fragment_retries': 10,
-        'socket_timeout': 30,
+        'retries': 5,
+        'fragment_retries': 5,
+        'socket_timeout': 20,
     }
+    # CORE FIX: Check for cookies file and add it to the options dictionary
     if os.path.exists(absolute_cookies_path):
-        opts['cookies'] = absolute_cookies_path
+        logger.info(f"Cookies file found at {absolute_cookies_path}, adding to yt-dlp options.")
+        opts['cookiefile'] = absolute_cookies_path
+    else:
+        logger.warning(f"Cookies file not found. Some content may be unavailable.")
+        
     if extra_opts:
         opts.update(extra_opts)
     return opts
@@ -75,8 +78,7 @@ def search_and_prepare_song_sse():
 
             yield sse_message({"status": "found_initial", "message": "Match found. Fetching details..."})
             
-            # Use yt-dlp to get metadata. This is much more reliable than calling a subprocess.
-            with yt_dlp.YoutubeDL(get_ydl_opts({'dump_single_json': True, 'extract_flat': 'in_playlist'})) as ydl:
+            with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
                 info = ydl.extract_info(f'https://music.youtube.com/watch?v={video_id}', download=False)
                 
             song_details = {
@@ -88,18 +90,19 @@ def search_and_prepare_song_sse():
                 "original_query": search_query
             }
             
-            yield sse_message({
-                "status": "ready_to_stream",
-                "message": f"Ready: {song_details['title']}",
-                "song_details": song_details,
-                "video_id": video_id
-            })
+            yield sse_message({ "status": "ready_to_stream", "message": f"Ready: {song_details['title']}", "song_details": song_details, "video_id": video_id })
 
+        # CORE FIX: Specific error handling for authentication/bot-check failures.
         except yt_dlp.utils.DownloadError as de:
-            logger.error(f"SSE: yt-dlp DownloadError during prep for \"{search_query}\": {de}", exc_info=True)
-            yield sse_message({"status": "error", "message": f"Download error: {str(de)}"})
+            error_string = str(de).lower()
+            if 'sign in' in error_string or 'confirm you’re not a bot' in error_string or 'authentication' in error_string:
+                logger.error(f"SSE: Authentication error for \"{search_query}\". Cookies may be invalid or expired.")
+                yield sse_message({"status": "error", "message": "Authentication Error: Your cookies.txt file is likely invalid or expired. Please update it."})
+            else:
+                logger.error(f"SSE: yt-dlp DownloadError for \"{search_query}\": {de}")
+                yield sse_message({"status": "error", "message": f"Download error: {str(de)}"})
         except Exception as e:
-            logger.error(f"SSE: Unexpected error in generate_events for \"{search_query}\": {e}", exc_info=True)
+            logger.error(f"SSE: Unexpected error for \"{search_query}\": {e}", exc_info=True)
             yield sse_message({"status": "error", "message": "An unexpected server error occurred."})
 
     return Response(generate_events(), mimetype='text/event-stream')
@@ -110,61 +113,27 @@ def stream_audio(video_id):
     if not video_id:
         return jsonify({"error": "Video ID is required"}), 400
 
-    logger.info(f"STREAM: Request for video_id: {video_id}")
-    
     try:
-        # Step 1: Get the direct audio stream URL using yt-dlp's Python library
         with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
             info = ydl.extract_info(f'https://music.youtube.com/watch?v={video_id}', download=False)
-            # Find the best audio-only format
-            best_audio_format = next((f for f in info['formats'][::-1] if f.get('acodec') != 'none' and f.get('vcodec') == 'none'), None)
-            if not best_audio_format:
-                best_audio_format = info['formats'][-1] # Fallback to the last format if no ideal one found
-            
+            best_audio_format = next((f for f in info['formats'][::-1] if f.get('acodec') != 'none' and f.get('vcodec') == 'none'), info['formats'][-1])
             direct_audio_url = best_audio_format['url']
 
-        logger.info(f"STREAM: Obtained direct audio URL for {video_id}.")
-
-        # Step 2: Use ffmpeg to stream this URL in chunks
-        ffmpeg_cmd = [
-            'ffmpeg',
-            '-i', direct_audio_url,
-            '-nostats', '-hide_banner',
-            '-loglevel', 'error',
-            '-vn',                  # No video
-            '-c:a', 'copy',         # Copy codec to avoid transcoding (fast)
-            '-movflags', 'frag_keyframe+empty_moov', 
-            '-f', 'webm',           # Output WebM container, compatible with Opus/Vorbis
-            'pipe:1'                # Output to stdout
-        ]
-        
-        logger.info(f"STREAM: Starting ffmpeg process for {video_id}")
+        ffmpeg_cmd = ['ffmpeg', '-i', direct_audio_url, '-nostats', '-hide_banner', '-loglevel', 'error', '-vn', '-c:a', 'copy', '-movflags', 'frag_keyframe+empty_moov', '-f', 'webm', 'pipe:1']
         ffmpeg_process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
         @stream_with_context
         def generate_audio_chunks():
             try:
                 while True:
-                    chunk = ffmpeg_process.stdout.read(8192) # Read in 8KB chunks
-                    if not chunk:
-                        logger.info(f"STREAM: ffmpeg stdout finished for {video_id}.")
-                        break
+                    chunk = ffmpeg_process.stdout.read(8192)
+                    if not chunk: break
                     yield chunk
-            except Exception as e:
-                logger.error(f"STREAM: Error during chunk generation for {video_id}: {e}")
             finally:
-                logger.info(f"STREAM: Cleaning up ffmpeg process for {video_id}")
-                if ffmpeg_process.poll() is None:
-                    ffmpeg_process.terminate()
-                    ffmpeg_process.wait()
-                stderr_output = ffmpeg_process.stderr.read().decode(errors='ignore').strip()
-                if stderr_output:
-                    logger.warning(f"STREAM: ffmpeg stderr for {video_id}: {stderr_output}")
-
+                if ffmpeg_process.poll() is None: ffmpeg_process.terminate()
         return Response(generate_audio_chunks(), mimetype='audio/webm')
-
     except Exception as e:
-        logger.error(f"STREAM: Fatal error setting up stream for {video_id}: {e}", exc_info=True)
+        logger.error(f"STREAM: Fatal error for {video_id}: {e}", exc_info=True)
         return Response("Error setting up stream", status=500, mimetype='text/plain')
 
 if __name__ == '__main__':
