@@ -35,7 +35,8 @@ def get_ydl_opts(extra_opts=None):
         # 'verbose': True, # Uncomment for maximum debugging from yt-dlp
     }
     if os.path.exists(absolute_cookies_path):
-        opts['cookiefile'] = absolute_cookies_path
+        # CORRECTED: The key for yt-dlp is 'cookies', not 'cookiefile'.
+        opts['cookies'] = absolute_cookies_path
         logger.info(f"Using cookies file: {absolute_cookies_path}")
     else:
         logger.warning(f"Cookies file not found at {absolute_cookies_path}. Download quality/availability may be affected.")
@@ -46,8 +47,9 @@ def get_ydl_opts(extra_opts=None):
 def _build_yt_dlp_command(base_command_list, opts_dict):
     cmd = list(base_command_list) # Start with base like ['yt-dlp']
     for k, v in opts_dict.items():
-        if k == 'cookiefile' and not os.path.exists(v): # Skip cookiefile if it doesn't exist
-            logger.warning(f"Skipping non-existent cookiefile for yt-dlp command: {v}")
+        # CORRECTED: The argument is '--cookies', which this check handles correctly now
+        if k == 'cookies' and not os.path.exists(v): # Skip cookiefile if it doesn't exist
+            logger.warning(f"Skipping non-existent cookies file for yt-dlp command: {v}")
             continue
         if isinstance(v, bool):
             if v: # True for flags like --quiet, --get-url
@@ -163,7 +165,10 @@ def search_and_prepare_song_sse():
             yield sse_message({
                 "status": "ready_to_stream",
                 "message": f"Ready to stream: {song_title}",
-                "song_details": song_details
+                "song_details": song_details,
+                # The video_id is now inside song_details, but it's good practice to also send it top-level
+                # for older frontend logic if needed. Your current JS reads it from song_details.
+                "video_id": video_id 
             })
 
         except subprocess.TimeoutExpired:
