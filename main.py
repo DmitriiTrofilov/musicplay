@@ -1,18 +1,25 @@
-from flask import Flask, request, jsonify, Response, stream_with_context
-from flask_cors import CORS
-from ytmusicapi import YTMusic
-import yt_dlp
 import os
 import logging
 import json
-import subprocess
+import uuid
+from flask import Flask, request, jsonify, send_from_directory
+from flask_cors import CORS
+from ytmusicapi import YTMusic
+import yt_dlp
+from threading import Thread
+import time
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# --- App & Temp Directory Setup ---
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
+TEMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'temp_audio')
+if not os.path.exists(TEMP_DIR):
+    os.makedirs(TEMP_DIR)
+    logger.info(f"Created temporary audio directory: {TEMP_DIR}")
 
 # --- YouTube Music API Setup ---
 try:
@@ -24,118 +31,114 @@ except Exception as e:
 COOKIES_FILE_PATH = 'cookies.txt'
 absolute_cookies_path = os.path.abspath(COOKIES_FILE_PATH)
 
-# --- Helper for yt-dlp options ---
-def get_ydl_opts(extra_opts=None):
-    opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'format': 'bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best',
-        'noplaylist': True,
-        'retries': 5,
-        'fragment_retries': 5,
-        'socket_timeout': 20,
-    }
-    # CORE FIX: Check for cookies file and add it to the options dictionary
-    if os.path.exists(absolute_cookies_path):
-        logger.info(f"Cookies file found at {absolute_cookies_path}, adding to yt-dlp options.")
-        opts['cookiefile'] = absolute_cookies_path
-    else:
-        logger.warning(f"Cookies file not found. Some content may be unavailable.")
-        
-    if extra_opts:
-        opts.update(extra_opts)
-    return opts
+# --- File Cleanup ---
+def cleanup_old_files():
+    """Cleans up audio files older than 1 hour."""
+    while True:
+        try:
+            for filename in os.listdir(TEMP_DIR):
+                file_path = os.path.join(TEMP_DIR, filename)
+                if os.path.isfile(file_path):
+                    # Check if the file is older than 3600 seconds (1 hour)
+                    if (time.time() - os.path.getmtime(file_path)) > 3600:
+                        os.remove(file_path)
+                        logger.info(f"Cleaned up old file: {filename}")
+        except Exception as e:
+            logger.error(f"Error during file cleanup: {e}")
+        time.sleep(600) # Run cleanup every 10 minutes
 
+# --- Main Endpoints ---
 @app.route('/')
 def health_check():
-    return jsonify({"status": "ok", "message": "Backend is running and ready to stream!"}), 200
+    return jsonify({"status": "ok", "message": "Backend is running (Download & Play Mode)!"}), 200
 
-def sse_message(data):
-    """Helper to format SSE messages."""
-    return f"data: {json.dumps(data)}\n\n"
-
-@app.route('/search_and_prepare_song_sse')
-def search_and_prepare_song_sse():
+@app.route('/prepare_song', methods=['GET'])
+def prepare_song():
     search_query = request.args.get('query')
     if not search_query:
-        return Response(sse_message({"status": "error", "message": "Search query is required"}), mimetype='text/event-stream')
+        return jsonify({"error": "Search query is required"}), 400
 
-    logger.info(f"SSE: Preparing song for query: \"{search_query}\"")
-
-    @stream_with_context
-    def generate_events():
-        try:
-            yield sse_message({"status": "searching", "message": f"Searching for \"{search_query}\"..."})
-            search_results = ytmusic.search(search_query, filter='songs')
-            if not search_results:
-                yield sse_message({"status": "error", "message": f"No songs found for \"{search_query}\""})
-                return
-
-            video_id = search_results[0].get('videoId')
-            if not video_id:
-                yield sse_message({"status": "error", "message": "Could not get video ID."})
-                return
-
-            yield sse_message({"status": "found_initial", "message": "Match found. Fetching details..."})
-            
-            with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
-                info = ydl.extract_info(f'https://music.youtube.com/watch?v={video_id}', download=False)
-                
-            song_details = {
-                "title": info.get('title', 'Unknown Title'),
-                "artist": info.get('artist') or info.get('channel') or 'Unknown Artist',
-                "video_id": video_id,
-                "duration_seconds": info.get('duration', 0),
-                "thumbnail_url": info.get('thumbnails', [{}])[-1].get('url', ''),
-                "original_query": search_query
-            }
-            
-            yield sse_message({ "status": "ready_to_stream", "message": f"Ready: {song_details['title']}", "song_details": song_details, "video_id": video_id })
-
-        # CORE FIX: Specific error handling for authentication/bot-check failures.
-        except yt_dlp.utils.DownloadError as de:
-            error_string = str(de).lower()
-            if 'sign in' in error_string or 'confirm you’re not a bot' in error_string or 'authentication' in error_string:
-                logger.error(f"SSE: Authentication error for \"{search_query}\". Cookies may be invalid or expired.")
-                yield sse_message({"status": "error", "message": "Authentication Error: Your cookies.txt file is likely invalid or expired. Please update it."})
-            else:
-                logger.error(f"SSE: yt-dlp DownloadError for \"{search_query}\": {de}")
-                yield sse_message({"status": "error", "message": f"Download error: {str(de)}"})
-        except Exception as e:
-            logger.error(f"SSE: Unexpected error for \"{search_query}\": {e}", exc_info=True)
-            yield sse_message({"status": "error", "message": "An unexpected server error occurred."})
-
-    return Response(generate_events(), mimetype='text/event-stream')
-
-
-@app.route('/stream_audio/<video_id>')
-def stream_audio(video_id):
-    if not video_id:
-        return jsonify({"error": "Video ID is required"}), 400
+    logger.info(f"PREPARE: Request received for query: \"{search_query}\"")
 
     try:
-        with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
-            info = ydl.extract_info(f'https://music.youtube.com/watch?v={video_id}', download=False)
-            best_audio_format = next((f for f in info['formats'][::-1] if f.get('acodec') != 'none' and f.get('vcodec') == 'none'), info['formats'][-1])
-            direct_audio_url = best_audio_format['url']
+        # Step 1: Search for the song to get its video ID and metadata
+        with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True, 'default_search': 'ytsearch1'}) as ydl:
+            search_results = ydl.extract_info(search_query, download=False)
+            if not search_results.get('entries'):
+                logger.warning(f"PREPARE: No results found for \"{search_query}\"")
+                return jsonify({"error": f"No results found for '{search_query}'"}), 404
+            
+            info = search_results['entries'][0]
+            video_id = info.get('id')
+            if not video_id:
+                return jsonify({"error": "Could not extract video ID from search result."}), 500
 
-        ffmpeg_cmd = ['ffmpeg', '-i', direct_audio_url, '-nostats', '-hide_banner', '-loglevel', 'error', '-vn', '-c:a', 'copy', '-movflags', 'frag_keyframe+empty_moov', '-f', 'webm', 'pipe:1']
-        ffmpeg_process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # Create a unique filename for the downloaded audio
+        unique_id = str(uuid.uuid4())
+        # Use a compatible extension like .webm which yt-dlp prefers for bestaudio
+        output_filename = f"{unique_id}.webm"
+        output_path = os.path.join(TEMP_DIR, output_filename)
 
-        @stream_with_context
-        def generate_audio_chunks():
-            try:
-                while True:
-                    chunk = ffmpeg_process.stdout.read(8192)
-                    if not chunk: break
-                    yield chunk
-            finally:
-                if ffmpeg_process.poll() is None: ffmpeg_process.terminate()
-        return Response(generate_audio_chunks(), mimetype='audio/webm')
+        # Step 2: Set up yt-dlp options for downloading
+        ydl_opts = {
+            'format': 'bestaudio[ext=webm]/bestaudio/best',
+            'outtmpl': output_path,
+            'quiet': True,
+            'no_warnings': True,
+            'noplaylist': True,
+        }
+        if os.path.exists(absolute_cookies_path):
+            ydl_opts['cookiefile'] = absolute_cookies_path
+
+        # Step 3: Download the audio file
+        logger.info(f"DOWNLOAD: Starting download for {video_id} to {output_path}")
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([f'https://www.youtube.com/watch?v={video_id}'])
+        
+        logger.info(f"DOWNLOAD: Finished download for {video_id}")
+
+        # Step 4: Prepare the response for the frontend
+        song_details = {
+            "title": info.get('title', 'Unknown Title'),
+            "artist": info.get('artist') or info.get('channel') or 'Unknown Artist',
+            "video_id": video_id,
+            "duration_seconds": info.get('duration', 0),
+            "thumbnail_url": info.get('thumbnails', [{}])[-1].get('url', ''),
+        }
+
+        # The URL the frontend will use to fetch the downloaded file
+        play_url = f"/audio/{output_filename}"
+
+        return jsonify({
+            "status": "success",
+            "message": "Song downloaded and ready for playback.",
+            "song_details": song_details,
+            "play_url": play_url
+        })
+
+    except yt_dlp.utils.DownloadError as de:
+        error_string = str(de).lower()
+        if 'sign in' in error_string or 'authentication' in error_string:
+            logger.error(f"PREPARE: Authentication error for \"{search_query}\".")
+            return jsonify({"error": "Authentication Error: Your cookies.txt file may be invalid."}), 403
+        else:
+            logger.error(f"PREPARE: yt-dlp DownloadError for \"{search_query}\": {de}")
+            return jsonify({"error": "A download error occurred."}), 500
     except Exception as e:
-        logger.error(f"STREAM: Fatal error for {video_id}: {e}", exc_info=True)
-        return Response("Error setting up stream", status=500, mimetype='text/plain')
+        logger.error(f"PREPARE: Unexpected error for \"{search_query}\": {e}", exc_info=True)
+        return jsonify({"error": "An unexpected server error occurred."}), 500
+
+@app.route('/audio/<filename>')
+def serve_audio(filename):
+    """Serves the downloaded audio file from the temp directory."""
+    logger.info(f"SERVE: Client requesting audio file: {filename}")
+    return send_from_directory(TEMP_DIR, filename, as_attachment=False)
 
 if __name__ == '__main__':
+    # Start the cleanup thread
+    cleanup_thread = Thread(target=cleanup_old_files, daemon=True)
+    cleanup_thread.start()
+    
     port = int(os.environ.get('PORT', 5001))
+    # Use a production-ready server like gunicorn or waitress instead of app.run in production
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
